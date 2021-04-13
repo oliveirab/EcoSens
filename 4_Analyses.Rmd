@@ -1,7 +1,7 @@
 ---
 title: "Sensitivity of primary productivity to climate is mediated by biodiversity"
 author: "Brunno F Oliveira"
-date: as.character(Sys.Date())
+date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_document:
     toc: true
