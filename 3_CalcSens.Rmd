@@ -1,0 +1,713 @@
+---
+title: "Sensitivity of primary productivity to climate is mediated by biodiversity"
+author: "Brunno F Oliveira"
+date: "as.character(Sys.Date())"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide 
+---
+
+*** 
+
+\newpage
+
+```{r packages, message=FALSE, include=FALSE}
+rm(list=ls())
+gc()
+
+# library(devtools)
+# install_github("jslefche/piecewiseSEM@devel", build_vignette = TRUE)
+
+# install.packages("BiocManager")
+# BiocManager::install("Rgraphviz")
+
+# Must use DiagrammeR v0.6
+# require(devtools)
+# install_version("DiagrammeR", version = "0.6", repos = "http://cran.us.r-project.org")
+
+list.of.packages <- c("raster","maps","nlme","spdep","rgdal","viridis","ggplot2","rworldmap","gridExtra","cowplot","effects","PerformanceAnalytics","classInt","reshape2","scales", "dplyr","foreach","doParallel","pbapply","maptools")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+sapply(list.of.packages, require, character.only = TRUE)
+
+# address to external HD
+externHD <- 'D:/GIS/' 
+
+```
+
+# Packages versions:
+```{r info, message=FALSE, include=FALSE}
+info <- sessionInfo()
+```
+
+We used `r info$R.version$version.string` and the following packages:   
+
+```{r packs, message=FALSE}
+data.frame(Package = unlist(lapply(info$otherPkgs, function(x) x$Package)), 
+           version = unlist(lapply(info$otherPkgs, function(x) x$Version)),
+           row.names = NULL)
+```
+
+# Load functions
+```{r load.fun, message=FALSE, warning=FALSE, eval=F}
+
+myramp <- hcl.colors(10)
+
+# BigBoys runs a OLS and returns 1) Std coeff, 2) Confidence intervals and 3) R2. 
+# Optionally, BigBoys can decompose the time-series and run OLS models on detrended components.
+# data = a dataset with the first column bein the response variable, and the following columns predictors.
+# Detrend = components of the time-series (seasonal, trend or random) to remove. Default is NULL. If Detrend = NULL, decomposition is not performed and the OLS model runs on raw values.
+# scale = Whether to z-transform variables. Default is FALSE. If scale = TRUE, coefficients reported become stardadized coefficients.
+
+# cell.test <- 3451
+# resp <- EVI_TS_month[cell.test, -1:-2]
+# pred <- pdsi_TS_month[cell.test, -1:-2]
+# pred <- data.frame(t(temp_TS_month[cell.test, -1:-2]),
+#                    t(prec_TS_month[cell.test, -1:-2]))
+# data.tmp. <- data.frame(t(scale(EVI_TS_month)[cell.test, -1:-2]),
+#                         t(scale(temp_TS_month)[cell.test, -1:-2]),
+#                         t(scale(prec_TS_month)[cell.test, -1:-2]))
+# BigBoys(data = scale(data.tmp.), scale = F)
+# 
+# rm(resp,pred,m,respi,predi,frequency.,start.,Detrend,data.tmp)
+BigBoys <- function(data, Detrend = NULL, frequency. = 12, start. = c(2000, 2), scale = F){
+  resp <- as.numeric(data[,1])
+  n.pred <- col(data)-1
+  pred <- data[,-1]
+  if(class(pred)=="matrix"){
+    pred <- data.frame(pred)
+  }
+  if(is.null(dim(pred))){
+    pred <- as.numeric(pred)
+  }
+  if(nrow(pred)==1){
+    pred <- as.numeric(pred)
+  }
+  data.tmp <- data.frame(cbind(resp,pred))
+  if(scale){
+    data.tmp <- data.frame(scale(data.tmp))
+  }
+  N = nrow(na.omit(data.tmp))
+  
+  if(!is.null(Detrend)){
+    if(any(is.na(data.tmp))){
+      data.tmp[is.na(data.tmp)] <- 0
+    }
+    nvars <- ncol(data.tmp)
+    data.ts <- lapply(1:nvars, function(x) 
+      ts(data.tmp[,x], frequency = frequency., start = start.))
+    testComp <- lapply(data.ts, decompose)
+    
+    data.tmp <- lapply(1:nvars, function(x) 
+      data.ts[[x]] - testComp[[x]][[Detrend]])
+    
+    data.tmp <- do.call(cbind,data.tmp)
+    colnames(data.tmp)[1] <- "resp"
+  }
+  m <- try(lm(resp ~ ., data = data.tmp), silent = T)
+  if(class(m) == 'try-error'){
+    return(list(Coeff = NA,
+                ConfInt = NA,
+                ConfIntRange = NA,
+                R2 = NA,
+                N = NA))
+  }
+  else{
+    Coeff = summary(m)$coefficients[-1,1]
+    ConfInt = confint.lm(m)[-1,]
+    if(is.null(nrow(ConfInt))) { ConfIntRange = as.numeric(dist(ConfInt)) }
+    if(!is.null(nrow(ConfInt))) {  ConfIntRange = unlist(apply(ConfInt,1,function(x) as.numeric(dist(x)))) }
+    R2 = summary(m)$r.squared
+    
+    return(list(Coeff = Coeff,
+                ConfInt = ConfInt,
+                ConfIntRange = ConfIntRange,
+                R2 = R2,
+                N = N))
+  }
+}
+
+
+# My standard raster transformation
+funtrans <- function(x){
+  crs(x) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+  x <- crop(x, crop.)
+  x <- projectRaster(x, crs = crs(land), method = "ngb")
+  x <- crop(x,land)
+  x
+}
+
+# create a reference projection raster in a longlat projection and 0.5x0.5 degree resolution
+reso <- 0.5
+mod.r <- raster(xmn = -180, xmx = 180, ymn = -60, ymx = 90,
+                crs = CRS("+proj=longlat +datum=WGS84"))
+res(mod.r) <- reso
+```
+
+# Coastal lines
+```{r land, eval=FALSE, message=FALSE, warning=FALSE}
+land <- readOGR("D:/GIS/Shp files/WE_contour.shp")
+crs(land) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+
+# project to equal area
+land <- spTransform(land, CRS("+proj=moll +datum=WGS84"))
+
+# crop shp
+crop. <- getMap(resolution = "coarse")
+crop. <- subset(crop., continent == "South America"|continent == "North America")
+crs(crop.) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+
+```
+
+# Load plant data
+```{r plants, eval=FALSE, message=FALSE, warning=FALSE}
+
+plants <- readRDS("Data/WorkData/plants.RDS")
+PD <- readRDS("Data/WorkData/PD.RDS")
+MPD <- readRDS("Data/WorkData/MPD.RDS")
+FDis <- readRDS("Data/WorkData/FDis.RDS")
+FRich <- readRDS("Data/WorkData/FRich.RDS")
+
+richness <- plants %>%
+  group_by(cell) %>% 
+  summarise(rich = length(unique(sps)))
+
+rownames(richness) <- richness$cell
+
+template_raster <- raster(xmn = -180, xmx = 180, 
+                          ymn = -60, ymx = 85, 
+                          resolution = .5, 
+                          crs="+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84")
+
+cells <- richness$cell
+XY <- data.frame(xyFromCell(template_raster, as.numeric(cells)))
+names(XY) <- c("x","y")
+
+biodata <- data.frame(rich = richness$rich, PD, MPD, FDis, FRich)
+
+# project to raster equal area
+bio.r <- list()
+for(i in 1:ncol(biodata)){
+  tmp. <- rasterFromXYZ(data.frame(XY, biodata[,i]))
+  bio.r[[i]] <- funtrans(tmp.)
+  
+}
+names(bio.r) <- colnames(biodata)
+
+```
+
+
+# Load climate metrics
+```{r clim, eval=FALSE, message=FALSE, warning=FALSE}
+
+EVI_month <- readRDS("C:/Clim_Stab/data/EVI_TS_month.Rds")
+pdsi_month <- readRDS("C:/Clim_Stab/data/pdsi_TS_month.Rds")
+prec_month <- readRDS("C:/Clim_Stab/data/prec_TS_month.Rds")
+tmax_month <- readRDS("C:/Clim_Stab/data/tmax_TS_month.Rds")
+tmin_month <- readRDS("C:/Clim_Stab/data/tmin_TS_month.Rds")
+temp_month <- lapply(1:length(tmax_month), 
+                     function(x) (tmax_month[[x]] + tmin_month[[x]])/2)
+rm(tmax_month,tmin_month)
+
+# crop
+EVI_month <- crop(mask(EVI_month, crop.), crop.)
+pdsi_month <- lapply(pdsi_month, function(x) crop(mask(x,crop.),crop.))
+prec_month <- lapply(prec_month, function(x) crop(mask(x,crop.),crop.))
+temp_month <- lapply(temp_month, function(x) crop(mask(x,crop.),crop.))
+
+years <- as.character(c(2000:2019))
+
+temp <- list() # Mean annual temperature
+temp_sea <- list() # Temperature seasonality
+prec <- list() # Total annual precipitation
+prec_sea <- list() # Precipitation seasonality
+prec_sea2 <- list() # Precipitation seasonality 2
+
+for(i in 1:length(years)){ cat("\r", "year", i , "from", length(years))
+  # Mean annual temperature
+  # subset for year i
+  rasub <- temp_month[[i]]
+  # calculate mean of values for year i
+  rasub <- calc(rasub, fun = function(x) mean(x, na.rm = T))
+  # make a raster
+  temp[[i]] <- rasub
+  
+  # Temperature seasonality (Following Worldclim)
+  # subset for year i
+  rasub <- temp_month[[i]]
+  # calculate mean of values for year i
+  rasub <- calc(rasub, fun = function(x) sd(x, na.rm = T)*100)
+  # make a raster
+  temp_sea[[i]] <- rasub
+  
+  # Total annual precipitation
+  # subset for year i
+  rasub <- prec_month[[i]]
+  # calculate sum of values for year i
+  rasub <- calc(rasub, fun = function(x) sum(x, na.rm = T))
+  # make a raster
+  prec[[i]] <- rasub
+  
+  # Precipitation seasonality (Following Worldclim)
+  # subset for year i
+  rasub <- prec_month[[i]]
+  # calculate mean of values for year i
+  rasub <- calc(rasub, fun = function(x) cv(x+1, na.rm = T)) # the "1 +" is to avoid strange CVs for areas where mean rainfaill is < 1)
+  # make a raster
+  prec_sea2[[i]] <- rasub
+  
+  # Precipitation seasonality (Following Xiaoli)
+  # subset for year i
+  rasub <- prec_month[[i]]
+  # calculate mean of values for year i
+  rasub <- calc(rasub, fun = function(x) sd(x+1, na.rm = T)) # the "1 +" is to avoid strange CVs for areas where mean rainfaill is < 1)
+  # make a raster
+  prec_sea[[i]] <- rasub
+}
+
+# Mean annual temperature
+temp <- calc(brick(temp), fun = function(x) mean(x, na.rm = T))
+# Temperature seasonality
+temp_sea <- calc(brick(temp_sea), fun = function(x) mean(x, na.rm = T))
+# Total annual precipitation
+prec <- calc(brick(prec), fun = function(x) mean(x, na.rm = T))
+# Precipitation seasonality
+prec_sea <- calc(brick(prec_sea), fun = function(x) mean(x, na.rm = T))
+# Precipitation seasonality 2
+prec_sea2 <- calc(brick(prec_sea2), fun = function(x) mean(x, na.rm = T)) 
+# PDSI
+pdsi <- calc(brick(pdsi_month), fun = function(x) mean(x, na.rm = T)) 
+pdsi <- crop(mask(pdsi,crop.),crop.)
+# EVI
+EVI <- calc(EVI_month, fun = function(x) mean(x, na.rm = T)) 
+EVI <- crop(mask(EVI,crop.),crop.)
+
+EVI_TS_month <- as.data.frame(EVI_month, xy = T); rm(EVI_month)
+pdsi_TS_month <- as.data.frame(stack(pdsi_month), xy = T); rm(pdsi_month)
+prec_TS_month <- as.data.frame(stack(prec_month), xy = T); rm(prec_month)
+temp_TS_month <- as.data.frame(stack(temp_month), xy = T); rm(temp_month)
+
+# Get only columns in common
+# cols <- names(EVI_TS_month)[names(EVI_TS_month) %in% names(prec_TS_month)]
+# EVI_TS_month <- EVI_TS_month[,cols]
+# pdsi_TS_month <- pdsi_TS_month[,cols]
+# prec_TS_month <- prec_TS_month[,cols]
+# temp_TS_month <- temp_TS_month[,cols]
+
+
+```
+
+# Historical climate
+## Climate change velocity 
+Downloaded from [Dryad](http://datadryad.org/resource/doi:10.5061/dryad.b13j1).
+Citation: Sandel, B. et al. (2011) The influence of Late Quaternary climate-change velocity on species endemism. Science.
+```{r get_velocity, eval=F}
+velo.r <- raster(paste(sep="",externHD,'#Environment/climate_velocity/Velocity.tif'))
+velo.r <- projectRaster(velo.r, crs=crs(land))
+velo.r <- crop(mask(velo.r, land), land)
+
+velo.r <- resample(velo.r, bio.r$rich, method= "bilinear")
+
+```
+
+## Climate variance over time (Hannah)
+Following Hannah & Guralnick 2019
+Citation: Owens, H. L., and R. Guralnick. 2019. climateStability: An R package to estimate climate stability from time-slice climatologies. Biodiversity Informatics 14:8–13.
+```{r get_stab, eval=F}
+# Stability over time metric
+climate.stab.r <- raster(paste(sep="",externHD,'#Environment/Climate_Stability_Hannah_Owens/climateStability.asc'))
+crs(climate.stab.r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+climate.stab.r <- projectRaster(climate.stab.r, crs=crs(land))
+climate.stab.r <- crop(mask(climate.stab.r, land), land)
+
+climate.stab.r <- resample(climate.stab.r, bio.r$rich, method= "bilinear")
+
+# Temperature stability over time metric
+temp.stab.r <- raster(paste(sep="",externHD,'#Environment/Climate_Stability_Hannah_Owens/tempStability.asc'))
+crs(temp.stab.r) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+temp.stab.r <- projectRaster(temp.stab.r, crs=crs(land))
+temp.stab.r <- crop(mask(temp.stab.r, land), land)
+
+temp.stab.r <- resample(temp.stab.r, bio.r$rich, method= "bilinear")
+
+```
+
+# Ecosystem sensitivity
+
+Ecosystem sensitivity to temporal variability environmental conditions is a key component of resilience. Resilient ecosystems are those that show little variability in its averaged state value. In contrast, systems showing lower resilience experience amplified responses to external forces, thus with a higher probability of crossing a threshold to an alternative state. We estimated ecosystem sensitivity (inverse of resilience) as the response of ecosystem primary productivity to temporal variation in environmental temperature and precipitation. 
+
+We estimated ecosystem sensitivity based on the Enhanced Vegetation Index (EVI), a proxy for primary productivity. EVI is a vegetation index with a more linear response that is less susceptible to saturation at high biomass areas compared to NDVI. For each grid-cell, we compiled a monthy averaged values, ranging over 20 years, from January 2000 to December 2019. 
+
+We estimate ecosystem sensitivity to temperature and precipitation, two key climate dimensions known to influence both spatial and temporal patterns of primary productibity. 
+Here, we calculated ecosystem sensitivity metric that reflect the ability of ecosystems to respond to 1) seasonality in temperature and precipitation and 2) climate change considering the annual trends of temperature and precipitation over the least 20 years. To calculate each of these metrics, we first decomposed each time-series into its trend, seasonality and error components. Ecosystem sensitivity to seasonality was defined as 
+
+## Sensitivity
+```{r sens, eval=FALSE, message=FALSE, warning=FALSE}
+
+ncels <- nrow(EVI_TS_month)
+
+cl <- makeCluster(20)
+clusterExport(cl, c("BigBoys", 
+                    "EVI_TS_month", "temp_TS_month", "prec_TS_month"))
+sens <- pblapply(1:ncels, function(x) { 
+  BigBoys(data.frame(t(EVI_TS_month[x,-1:-2]),
+                     t(temp_TS_month[x,-1:-2]),
+                     t(prec_TS_month[x,-1:-2])),
+          scale = T) }, 
+  cl = cl)
+stopCluster(cl)
+
+# get absolute coefficients
+sens.temp <- abs(sapply(sens, function(i) if(is.na(i)){NA} else {i$Coeff[1]}))
+sens.prec <- abs(sapply(sens, function(i) if(is.na(i)){NA} else {i$Coeff[2]}))
+
+# get confident intervals
+sens.temp.confint <- sapply(sens, function(i) if(is.na(i)){NA} else {i$ConfIntRange[1]})
+sens.prec.confint <- sapply(sens, function(i) if(is.na(i)){NA} else {i$ConfIntRange[2]})
+
+# Get R2
+sens.r2 <- sapply(sens, function(i) if(is.na(i)){NA} else {i$R2})
+# Get N obs
+sens.N <- sapply(sens, function(i) if(is.na(i)){NA} else {i$N})
+
+# Remove cells with N < 100 months
+rem <- which(sens.N < 100)
+
+sens.temp[rem] <- NA
+sens.temp.confint[rem] <- NA
+sens.prec[rem] <- NA
+sens.prec.confint[rem] <- NA
+sens.r2[rem] <- NA
+
+if(any(na.omit(sens.temp) > 1)){ sens.temp[which(sens.temp > 1)] <- 1 }
+if(any(na.omit(sens.prec) > 1)){ sens.prec[which(sens.prec > 1)] <- 1 }
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.temp)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.temp.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.prec)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.prec.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.r2)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.N)))
+
+```
+
+## Sensitivity to climate change
+Remove the seasonality component
+```{r sens.cc, eval=FALSE, message=FALSE, warning=FALSE}
+
+ncels <- nrow(EVI_TS_month)
+
+cl <- makeCluster(20)
+clusterExport(cl, c("BigBoys", 
+                    "EVI_TS_month", "temp_TS_month", "prec_TS_month"))
+sens.cc <- pblapply(1:ncels, function(x) { 
+  BigBoys(data.frame(t(EVI_TS_month[x,-1:-2]),
+                     t(temp_TS_month[x,-1:-2]),
+                     t(prec_TS_month[x,-1:-2])),
+          scale = T, Detrend = "seasonal") }, 
+  cl = cl)
+stopCluster(cl)
+
+# get absolute coefficients
+sens.cc.temp <- abs(sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$Coeff[1]}))
+sens.cc.prec <- abs(sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$Coeff[2]}))
+
+# get confident intervals
+sens.cc.temp.confint <- sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$ConfIntRange[1]})
+sens.cc.prec.confint <- sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$ConfIntRange[2]})
+
+# Get R2
+sens.cc.r2 <- sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$R2})
+# Get N obs
+sens.cc.N <- sapply(sens.cc, function(i) if(is.na(i)){NA} else {i$N})
+
+# Remove cells with N < 100 months
+rem <- which(sens.cc.N < 100)
+
+sens.cc.temp[rem] <- NA
+sens.cc.temp.confint[rem] <- NA
+sens.cc.prec[rem] <- NA
+sens.cc.prec.confint[rem] <- NA
+sens.cc.r2[rem] <- NA
+
+if(any(na.omit(sens.cc.temp) > 1)){ sens.cc.temp[which(sens.cc.temp > 1)] <- 1 }
+if(any(na.omit(sens.cc.prec) > 1)){ sens.cc.prec[which(sens.cc.prec > 1)] <- 1 }
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.temp)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.temp.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.prec)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.prec.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.r2)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.cc.N)))
+
+
+```
+
+## Sensitivity to seasonality
+Remove the trend component
+```{r sens_sea, eval=FALSE, message=FALSE, warning=FALSE}
+
+ncels <- nrow(EVI_TS_month)
+
+cl <- makeCluster(20)
+clusterExport(cl, c("BigBoys", 
+                    "EVI_TS_month", "temp_TS_month", "prec_TS_month"))
+sens.sea <- pblapply(1:ncels, function(x) { 
+  BigBoys(data.frame(t(EVI_TS_month[x,-1:-2]),
+                     t(temp_TS_month[x,-1:-2]),
+                     t(prec_TS_month[x,-1:-2])),
+          scale = T, Detrend = "trend") }, 
+  cl = cl)
+stopCluster(cl)
+
+# get absolute coefficients
+sens.sea.temp <- abs(sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$Coeff[1]}))
+sens.sea.prec <- abs(sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$Coeff[2]}))
+
+# get confident intervals
+sens.sea.temp.confint <- sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$ConfIntRange[1]})
+sens.sea.prec.confint <- sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$ConfIntRange[2]})
+
+# Get R2
+sens.sea.r2 <- sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$R2})
+# Get N obs
+sens.sea.N <- sapply(sens.sea, function(i) if(is.na(i)){NA} else {i$N})
+
+# Remove cells with N < 100 months
+rem <- which(sens.sea.N < 100)
+
+sens.sea.temp[rem] <- NA
+sens.sea.temp.confint[rem] <- NA
+sens.sea.prec[rem] <- NA
+sens.sea.prec.confint[rem] <- NA
+sens.sea.r2[rem] <- NA
+
+if(any(na.omit(sens.sea.temp) > 1)){ sens.sea.temp[which(sens.sea.temp > 1)] <- 1 }
+if(any(na.omit(sens.sea.prec) > 1)){ sens.sea.prec[which(sens.sea.prec > 1)] <- 1 }
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.temp)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.temp.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.prec)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.prec.confint)))
+
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.r2)))
+plot(rasterFromXYZ(data.frame(EVI_TS_month[, 1:2],sens.sea.N)))
+
+
+```
+
+
+# Load Biomes
+Load biomes from Olson et al. 2001 BioScience 
+```{r biome, eval=FALSE, message=FALSE, warning=FALSE}
+biome.shp <- readShapeSpatial(paste(sep="",externHD,"WWF_biomas_ecoregions/wwf_terr_ecos.shp"))
+crs(biome.shp) <- crs(mod.r)
+
+# biomes names
+bionames <- c(
+  "Tropical & Subtropical Moist Broadleaf Forests",
+  "Tropical & Subtropical Dry Broadleaf Forests", 
+  "Tropical & Subtropical Coniferous Forests",
+  "Temperate Broadleaf & Mixed Forests",
+  "Temperate Conifer Forests",
+  "Boreal Forests/Taiga",
+  "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+  "Temperate Grasslands, Savannas & Shrublands",
+  "Flooded Grasslands & Savannas",
+  "Montane Grasslands & Shrublands",
+  "Tundra",
+  "Mediterranean Forests, Woodlands & Scrub",
+  "Deserts & Xeric Shrublands",
+  "Mangroves")
+
+# biomes names
+bionames2 <- c(
+  "Trop & Subtr Moist Broadleaf Forests", # 1 - 008346
+  "Trop & Subtr Dry Broadleaf Forests",  # 2 - C5B82E
+  "Trop & Subtr Coniferous Forests", # 3 - A0CD44
+  "Temp Broadleaf & Mixed Forests", # 4 - 0B7462
+  "Temp Conifer Forests", # 5 - 006F83
+  "Boreal Forests/Taiga", # 6 - 87BC9E
+  "Trop & Subtrop Grasslands, Savannas & Shrublands", # 7 - F9A61B
+  "Temp Grasslands, Savannas & Shrublands", # 8 - FAD505
+  "Flooded Grasslands & Savannas", # 9 - 67C7C0
+  "Montane Grasslands & Shrublands", # 10 - C9A475
+  "Tundra", # 11 - BDDB95
+  "Med Forests, Woodlands & Scrub", # 12 - EE1D23
+  "Des & Xeric Shrublands", # 13 - EB7C5D
+  "Mangroves") # 14 - ED027D
+
+biomeColors <- c("#008346", # 1
+                 "#C5B82E", # 2
+                 "#A0CD44", # 3
+                 "#0B7462", # 4
+                 "#006F83", # 5
+                 "#87BC9E", # 6
+                 "#F9A61B", # 7
+                 "#FAD505", # 8
+                 "#67C7C0", # 9
+                 "#C9A475", # 10
+                 "#BDDB95", # 11
+                 "#EE1D23", # 12
+                 "#EB7C5D", # 13
+                 "#ED027D") # 14
+
+
+## Fixing Neotropical biomes
+biome.shp$BIOME[biome.shp$REALM=="NT" & biome.shp$BIOME==2]<-13
+#biome.shp$BIOME[biome.shp$BIOME==12]<-13
+biome.shp$BIOME[biome.shp$BIOME==9]<-7
+biome.shp$BIOME[biome.shp$ECO_NAME %in% c("Sechura desert","Atacama desert")]<-12
+biome.shp$BIOME[biome.shp$ECO_NAME %in% c("Chilean matorral")]<-13
+
+## Color biomes
+biome.shp@data$COLOUR <- "#FFFFFF"
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 1)] <- '#008346'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 2)] <- '#C5B82E'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 3)] <- '#A0CD44'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 4)] <- '#0B7462'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 5)] <- '#006F83'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 6)] <- '#87BC9E'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 7)] <- '#F9A61B'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 8)] <- '#FAD505'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 9)] <- '#67C7C0'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 10)] <- '#C9A475'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 11)] <- '#BDDB95'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 12)] <- '#EE1D23'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 13)] <- '#EB7C5D'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 14)] <- '#ED027D'
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 98)] <- NA
+biome.shp@data$COLOUR[which(biome.shp@data$BIOME == 99)] <- NA
+
+# rasterize
+extent(mod.r) <- extent(biome.shp)
+biome.r <- rasterize(biome.shp, mod.r, field = 'BIOME', fun = function(x,...) min(x, na.rm = T))
+biome <- as.vector(extract(biome.r,XY,method='simple',fun=min(x)))
+
+biome<-gdata::trim(biome)
+biome<-round(as.numeric(biome),0)
+biome[which(biome>14)] <- NA
+
+# Realms from Olson  ----
+WWF.shp <- readShapeSpatial(paste(sep="",externHD,"WWF_biomas_ecoregions/wwf_terr_ecos.shp"))
+crs(WWF.shp) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+WWF.shp <- spTransform(WWF.shp, crs(mod.r))
+WWF <- over(SpatialPoints(coords = XY, crs(mod.r)), WWF.shp)
+
+Realms2 <- as.character(WWF$REALM)
+# test
+as.numeric.factor <- function(x) { seq_along(levels(x))[x] }
+Realms <- as.numeric(as.numeric.factor(as.factor(Realms2)))
+plot(rasterFromXYZ(data.frame(XY,Realms)))
+
+# Fix Realms2 names
+Realms2[which(Realms2=="AA")] <- "Australasia"
+Realms2[which(Realms2=="AN")] <- "Antarctic"
+Realms2[which(Realms2=="AT")] <- "Afrotropics"
+Realms2[which(Realms2=="IM")] <- "IndoMalay"
+Realms2[which(Realms2=="NA")] <- "Nearctic"
+Realms2[which(Realms2=="NT")] <- "Neotropics"
+Realms2[which(Realms2=="OC")] <- "Oceania"
+Realms2[which(Realms2=="PA")] <- "Palearctic"
+
+# Remove Antarctic and Oceania
+Realms2[which(Realms2=="Antarctic")] <- NA
+Realms2[which(Realms2=="Oceania")] <- NA
+
+realmnames <- na.omit(as.character(unique(Realms2)))
+
+```
+
+# Group vars
+```{r group_vars, eval=FALSE, message=FALSE, warning=FALSE}
+
+clim.vars <- list(pdsi, prec, temp, 
+                  temp_sea, prec_sea, prec_sea2, 
+                  EVI)
+clim.vars <- lapply(clim.vars, function(x) {
+  crs(x) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+  x <- projectRaster(x, crs = crs(land), method = "ngb")
+  x <- crop(x, land)
+  x
+})
+names(clim.vars) <- c("pdsi", "prec", "temp", 
+                      "temp_sea", "prec_sea", "prec_sea2", 
+                      "EVI")
+
+hist.vars <- list(velocity = velo.r, clim.stab = climate.stab.r, temp.stab = temp.stab.r)
+
+vars <- list(abs(sens.temp), sens.temp.confint,
+             abs(sens.prec), sens.prec.confint,
+             sens.N, sens.r2,
+             abs(sens.cc.temp), sens.cc.temp.confint,
+             abs(sens.cc.prec), sens.cc.prec.confint,
+             sens.cc.N, sens.cc.r2,
+             abs(sens.sea.temp), sens.sea.temp.confint,
+             abs(sens.sea.prec), sens.sea.prec.confint,
+             sens.sea.N, sens.sea.r2)
+names(vars) <- c("sens.temp", "sens.temp.confint",
+                 "sens.prec", "sens.prec.confint",
+                 "sens.N", "sens.r2",
+                 "sens.cc.temp", "sens.cc.temp.confint",
+                 "sens.cc.prec", "sens.cc.prec.confint",
+                 "sens.cc.N", "sens.cc.r2",
+                 "sens.sea.temp", "sens.sea.temp.confint",
+                 "sens.sea.prec", "sens.sea.prec.confint",
+                 "sens.sea.N", "sens.sea.r2")
+vars <- lapply(vars, function(x) {
+  x <- rasterFromXYZ(data.frame(EVI_TS_month[,1:2], x))
+  crs(x) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+  x <- projectRaster(x, crs = crs(land), method = "ngb")
+  x <- crop(x, land)
+  x
+})
+
+biomess <- list(biome, Realms)
+names(biomess) <- c("biome", "realm")
+biomess <- lapply(biomess, function(x) {
+  x <- rasterFromXYZ(data.frame(XY, x))
+  crs(x) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+  x <- crop(x, crop.)
+  x <- projectRaster(x, crs = crs(land), method = "ngb")
+  x <- crop(x, land)
+  x
+})
+
+vars.ras <- stack(stack(clim.vars), stack(vars), 
+                  stack(biomess), stack(bio.r), stack(hist.vars))
+
+vars.ras[vars.ras$rich<5] <- NA
+
+dataset <- as.data.frame(vars.ras, xy = T)
+
+dataset$biome <- as.character(bionames[dataset$biome])
+dataset$realm <- as.character(realmnames[dataset$realm])
+
+# Forest vs non-forest biomes
+dataset$forest <- "non-forest"
+dataset$forest[grep("Forest",dataset$biome)] <- "forest"
+
+# Tropical vs non-tropical biomes
+dataset$tropical <- "not-tropical"
+dataset$tropical[grep("Trop",dataset$biome)] <- "tropical"
+
+saveRDS(dataset, "Data/WorkData/dataset.RDS")
+saveRDS(vars.ras, "Data/WorkData/vars.ras.RDS")
+
+```
+
+# Save
+```{r save, eval=FALSE, message=FALSE, warning=FALSE}
+
+saveRDS(dataset, "Data/WorkData/dataset.RDS")
+
+save.image("R/3_CalcSens.RData")
+```

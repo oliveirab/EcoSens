@@ -1,0 +1,541 @@
+---
+title: "Sensitivity of primary productivity to climate is mediated by biodiversity"
+author: "Brunno F Oliveira"
+date: "as.character(Sys.Date())"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+*** 
+
+\newpage
+
+# Packages versions:
+```{r info, message=FALSE,echo=F}
+info <- sessionInfo()
+```
+
+We used `r info[1]$R$ver` and the following packages:
+
+# Load packages
+```{r packages, message=FALSE, include=FALSE}
+
+rm(list=ls())
+gc()
+
+list.of.packages <- c("raster","maps","nlme","spdep","rgdal","viridis","ggplot2","rworldmap","gridExtra","cowplot","effects","PerformanceAnalytics","dplyr","Rphylopars","pbapply","parallel","doParallel","reshape","picante","FD","corrplot","ggvenn","WorldFlora")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+sapply(list.of.packages, require, character.only = TRUE)
+
+```
+
+# Load image
+```{r load, message=FALSE, warning=FALSE, include=FALSE}
+
+load("R/FixData.RData")
+
+```
+
+# Load coastal lines
+```{r land, eval=FALSE, message=FALSE, warning=FALSE}
+
+land <- readOGR("D:/GIS/Shp files/WE_contour.shp")
+crs(land) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+
+# project to equal area
+land <- spTransform(land, CRS("+proj=moll +datum=WGS84"))
+
+```
+
+# Load occurrence data
+Data downloaded from BIEN version 4.1
+This comes at a 1/2 dg (~50km x 50km) resolution
+
+```{r occr, eval=FALSE, message=FALSE, warning=FALSE}
+
+plants <- readRDS("Data/BIEN_skinny_ranges.RDs")
+plants <- data.frame(plants)
+names(plants) <- c("sps","cell")
+
+# get sp names
+sp.ranges <- unique(plants$sps) 
+
+# N species with range data
+length(sp.ranges) # 98826
+
+# calc richness with the full data
+richness.full <- plants %>%
+  group_by(cell) %>% 
+  summarise(rich = length(unique(sps)))
+
+rownames(richness.full) <- richness.full$cell
+
+template_raster <- raster(xmn = -180, xmx = 180, 
+                          ymn = -60, ymx = 85, 
+                          resolution = .5, crs=crs(land))
+
+cells <- richness.full$cell
+XY <- data.frame(xyFromCell(template_raster, as.numeric(cells)))
+names(XY) <- c("x","y")
+
+plot(rasterFromXYZ(data.frame(XY, richness.full$rich)))
+
+```
+
+# Load phylogeny
+We downloaded 100 random phylogenies from BIEN. Seed = 666.
+```{r phy, eval=FALSE, message=FALSE, warning=FALSE}
+
+phy <- readRDS("Data/BIEN_phylogeny_n100.RDS")
+
+# get sp names
+sp.phy <- unique(phy[[1]]$tip.label)
+# N species in phy
+length(sp.phy) # 81274
+
+```
+
+# Load trait data
+
+## BIEN
+
+We downloaded data for the 6 most complete traits from BIEN: 
+* leaf area per leaf dry mass (SLA)
+* whole plant height / maximum whole plant height (Height)
+* seed mass (SeedMass)
+* leaf nitrogen content per leaf dry mass (N)
+* leaf phosphorus content per leaf dry mass (P)
+* longest whole plant longevity (Longevity)
+* stem wood density (WoodDens)
+
+```{r traits_bien, eval=FALSE, message=FALSE, warning=FALSE}
+# Load traits from BEIN
+traitsBIEN <- readRDS("Data/BIEN_traits.Rds")
+names(traitsBIEN) <- sapply(traitsBIEN, function(x) unique(x$trait_name))
+# combine trait data into a single table
+traitsBIEN <- do.call("rbind", traitsBIEN)
+# get only columns of interest
+traitsBIEN <- traitsBIEN[,1:3]
+colnames(traitsBIEN) <- c("sps", "trait", "value")
+# omit NAs
+traitsBIEN <- na.omit(traitsBIEN)
+# Fix plant height trait
+traitsBIEN$trait[which(traitsBIEN$trait=="maximum whole plant height")] <- "whole plant height"
+# Fix plant plant longevity
+traitsBIEN$trait[which(traitsBIEN$trait=="longest whole plant longevity")] <- "maximum whole plant longevity"
+# delete these two traits
+traitsBIEN <- traitsBIEN[-which(traitsBIEN$trait=="whole plant growth form"),]
+traitsBIEN <- traitsBIEN[-which(traitsBIEN$trait=="whole plant dispersal syndrome"),]
+# trait value as numeric
+traitsBIEN$value <- as.numeric(traitsBIEN$value)
+# fix sp names
+traitsBIEN$sps <- gsub(" ","_",traitsBIEN$sps)
+# get sp names
+sp.traitsBIEN <- unique(traitsBIEN$sps)
+# N species in traitBIEN
+length(sp.traitsBIEN) # 21629
+
+# N species per trait
+obs.BIEN <- traitsBIEN %>%
+  group_by(trait) %>%
+  summarise(N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2))
+
+DT::datatable(obs.BIEN)
+
+```
+We downloaded trait data from BIEN, giving a total of `r length(sp.traitsBIEN)` species. 
+
+
+## TRY
+We downloaded data for the 9 most complete traits from TRY: 
+* Leaf area per leaf dry mass (SLA)
+* Leaf nitrogen content per leaf dry mass (N)
+* Leaf phosphorus content per leaf dry mass (P)
+* Plant height vegetative (Height)
+* Plant lifespan (Longevity)
+* Root rooting depth (RootDepth)
+* Seed dry mass (SeedMass)
+* tem specific density or wood density (WoodDens)
+
+```{r traits_try, eval=FALSE, message=FALSE, warning=FALSE}
+# Load traits from TRY
+traitsTRY <- readRDS("Data/TRYdata_cont.RDS")
+traitsTRY <- traitsTRY[,c("AccSpeciesName","TraitName","StdValue")]
+colnames(traitsTRY) <- c("sps", "trait", "value")
+traitsTRY$sps <- gsub(" ","_",traitsTRY$sps)
+# Remove CN trait
+traitsTRY <- traitsTRY[-which(traitsTRY$trait=="Leaf carbon/nitrogen (C/N) ratio"),]
+
+# get sp names
+sp.traitsTRY <- unique(traitsTRY$sps)
+# N species in traitsTRY
+length(sp.traitsTRY) # 51655
+
+# N species per trait
+obs.t <- traitsTRY %>%
+  group_by(trait) %>%
+  summarise(N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2))
+DT::datatable(obs.t)
+
+##########
+# species in BIEN but not in TRY
+length(which(!sp.traitsBIEN %in% sp.traitsTRY)) # 3078
+# species in TRY but not in BIEN
+length(which(!sp.traitsTRY %in% sp.traitsBIEN)) # 33104. PS: TRY data is global, while BIEN is only for the Americas
+##########
+
+```
+
+We downloaded trait data from TRY, giving a total of `r length(sp.traitsTRY)` species. 
+
+
+## Merge
+
+```{r traits_merge, eval=FALSE, message=FALSE, warning=FALSE}
+# merge both datasets
+# fix names
+colnames(traitsBIEN)
+colnames(traitsTRY)
+
+# fix trait names
+unique(traitsBIEN$trait)
+traitsBIEN$trait[which(traitsBIEN$trait=="whole plant height")] <- "Height"
+traitsBIEN$trait[which(traitsBIEN$trait=="leaf nitrogen content per leaf dry mass")] <- "N"
+traitsBIEN$trait[which(traitsBIEN$trait=="leaf area per leaf dry mass")] <- "SLA"
+traitsBIEN$trait[which(traitsBIEN$trait=="seed mass")] <- "SeedMass"
+traitsBIEN$trait[which(traitsBIEN$trait=="leaf phosphorus content per leaf dry mass")] <- "P"
+traitsBIEN$trait[which(traitsBIEN$trait=="maximum whole plant longevity")] <- "Longevity"
+traitsBIEN$trait[which(traitsBIEN$trait=="stem wood density")] <- "WoodDens"
+
+unique(traitsTRY$trait)
+traitsTRY$trait[which(traitsTRY$trait=="Plant height vegetative")] <- "Height"
+traitsTRY$trait[which(traitsTRY$trait=="Plant lifespan (longevity)")] <- "Longevity"
+traitsTRY$trait[which(traitsTRY$trait=="Leaf phosphorus (P) content per leaf dry mass")] <- "P"
+traitsTRY$trait[which(traitsTRY$trait=="Leaf nitrogen (N) content per leaf dry mass")] <- "N"
+traitsTRY$trait[which(traitsTRY$trait=="Leaf area per leaf dry mass (specific leaf area, SLA or 1/LMA): undefined if petiole is in- or excluded")] <- "SLA"
+traitsTRY$trait[which(traitsTRY$trait=="Stem specific density (SSD) or wood density (stem dry mass per stem fresh volume)")] <- "WoodDens"
+traitsTRY$trait[which(traitsTRY$trait=="Seed dry mass")] <- "SeedMass"
+traitsTRY$trait[which(traitsTRY$trait=="Root rooting depth")] <- "RootDepth"
+
+# combine
+traitslong <- rbind(traitsBIEN,traitsTRY)
+traitslong$sps <- gsub(" ","_",traitslong$sps)
+
+# get median value per trait
+traitslong.med <- traitslong %>%
+  group_by(sps, trait) %>%
+  summarise(trait_value = median(value, na.rm = T))
+# from long to short
+traits <- cast(traitslong.med, sps~trait)
+
+# Any sp without traits?
+any(which(rowSums(traits[,-1])==0))
+
+# get sp names
+sp.traits <- unique(traits$sps)
+# N species with traits
+length(sp.traits) # 54733
+
+# The basic species list to work are those with range and phylogenetic data
+# These were call sp.work
+sp.work <- sp.phy[which(sp.phy %in% sp.ranges)]
+
+# N species per trait
+obs.total <- traitslong %>%
+  group_by(trait) %>%
+  summarise(N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2),
+            Percent_total = round((length(which(unique(sps) %in% sp.work))/length(sp.work))*100,2))
+obs.total2 <- traitslong %>%
+  summarise(trait = "Total",
+            N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2),
+            Percent_total = round((length(which(unique(sps) %in% sp.work))/length(sp.work))*100,2))
+obs.total <- rbind(obs.total, obs.total2)
+DT::datatable(obs.total)
+ 
+
+# N species per trait (for species in the work data)
+obs.total <- traitslong[which(traitslong$sps %in% sp.work),] %>%
+  group_by(trait) %>%
+  summarise(N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2),
+            Percent_total = round((length(which(unique(sps) %in% sp.work))/length(sp.work))*100,2))
+obs.total2 <- traitslong[which(traitslong$sps %in% sp.work),] %>%
+  summarise(trait = "Total",
+            N_sps = length(unique(sps)),
+            N_obs = length(sps),
+            Mean_obs_sps = round(N_obs/N_sps,2),
+            Percent_total = round((length(which(unique(sps) %in% sp.work))/length(sp.work))*100,2))
+obs.total <- rbind(obs.total, obs.total2)
+DT::datatable(obs.total) 
+
+# give NA if trait value == 0
+traits[traits==0] <- NA
+
+```
+We merge trait data from BIEN and TRY, giving a total of `r length(sp.traits)` species.
+
+## Traits correlations
+```{r traits_merge, echo=FALSE, message=FALSE, warning=FALSE, fig.height=6, fig.width=6}
+
+# correlation among traits
+res <- cor(traits[,-1], use = "complete.obs")
+rownames(res) <- colnames(res) <- names(traits[,-1])
+corrplot.mixed(res, lower = "number", upper = "circle", order = "hclust", 
+               tl.col = "black", tl.srt = 45)
+
+```
+
+# Species in common across datasets
+## Before resolving species names
+```{r sp_in_common, eval=FALSE, message=FALSE, warning=FALSE}
+
+Ns <- list(Range = sp.ranges, Phylogeny = sp.phy, Trait = sp.traits)
+names(Ns) <- c(paste("Range\n(", length(sp.ranges),")",sep = ""), 
+               paste("Phylogeny\n(", length(sp.phy),")",sep = ""), 
+               paste("Trait\n(", length(sp.traits),")",sep = ""))
+
+ggvenn(Ns, stroke_size = 0.5, set_name_size = 4)
+
+
+```
+
+There were `r length(Reduce(intersect, list(sp.ranges,sp.phy,sp.traits)))` species in common among the three datasets (ranges, phylogeny and traits).   
+
+## Resolve species names
+Resolve names based on the World Flora Online (WFO) taxonomic backbone.
+The user needs to first download a static copy of the Taxonomic Backbone data from http://www.worldfloraonline.org/downloadData. 
+We also removed taxons containing 'sp.', 'subgen.', 'sect.' and 'cf.' (N=)
+```{r res_sps, eval=FALSE, message=FALSE, warning=FALSE}
+# load WFO backbone
+WFO <- data.table::fread("R/Cluster/Resolve_sp_names/WFO_Backbone_Plants/classification.txt", encoding="UTF-8")
+
+# all names
+Ori = gsub("_"," ",unique(c(sp.ranges,sp.phy,sp.traits))) 
+length(unique(Ori)) # 153936
+
+# Remove plant names containing 'sp.', 'subsp.', 'subgen.', 'sect.' and 'cf.'
+Ori <- Ori[-grep('sp\\.',Ori)]
+Ori <- Ori[-grep('subgen\\.',Ori)]
+Ori <- Ori[-grep('sect\\.',Ori)]
+Ori <- Ori[-grep('cf\\.',Ori)] 
+length(unique(Ori)) # 153894
+
+# Resolve species names using my own code
+DevOlve <- function(x, db){
+  res <- db[which(db$scientificName == x),]
+  if(any(res$taxonomicStatus=="Accepted")){
+    res <- res[which(res$taxonomicStatus=="Accepted"),]
+  }
+  else{
+    if(any(res$taxonomicStatus=="Synonym")){
+      id. <- res$acceptedNameUsageID
+      res <- db[which(db$taxonID %in% id.),]
+      res <- res[which(res$taxonomicStatus=="Accepted"),]
+    }
+  }
+  if(nrow(res)>1){
+    res <- res[-which(res$scientificNameID==""),]
+    test <- res$specificEpithet == strsplit(x," ")[[1]][2]
+    if(any(test)){
+      res <- res[which(test),]
+    } else {
+      res <- res[1,]
+    }
+  }
+  if(!nrow(res)==0){
+    newname <- paste(res$genus, res$specificEpithet)
+    if(any(duplicated(newname))){
+      newname <- newname[-which(duplicated(newname))]
+    }
+    return(newname)
+  }
+}
+
+cl <- makeCluster(detectCores()-1)
+clusterExport(cl, c("Ori", "DevOlve", "WFO"))
+
+newnames <- pbsapply(Ori, function(sp) DevOlve(x = sp, db = WFO),
+                     cl = cl)
+stopCluster(cl)
+# took 27m 56s
+
+unlistnewnames <- newnames
+unlistnewnames[sapply(unlistnewnames, is.null)] <- NA
+
+length(Ori)
+length(newnames)
+length(unlistnewnames)
+length(unlist(unlistnewnames))
+
+All.sps <- data.frame(Ori, newnames = unlist(unlistnewnames))
+
+#########################
+# Use “fuzzy matching” method from the R package "World Flora Online" for name identication.
+# We used a maximum fuzzy distance of three to avoid incorrect species name matches.
+tolook <- which(is.na(All.sps$newnames))
+lookup <- All.sps$Ori[tolook]
+# Divide species list into 200 chunks
+spchunks <- split(lookup, sort(rep_len(1:200, length(lookup))))
+# N species in each chunck
+# head(lapply(spchunks, length))
+# View(All.sps[tolook,])
+
+cl <- makeCluster(detectCores()-2)
+clusterExport(cl, c("spchunks", "WFO.match", "WFO"))
+
+newnames2 <- pblapply(spchunks,
+                     function(sp)
+                       WFO.match(spec.data = data.frame(spec.name=sp), WFO.data = WFO),
+                     cl = cl)
+stopCluster(cl)
+# took 03h 20m 47s
+
+newnames2 <- lapply(newnames2, WFO.one)
+newnames2 <- do.call("rbind", newnames2)
+
+# Add new look ups to sp list
+All.sps$newnames[tolook] <- paste(newnames2$genus, newnames2$specificEpithet)
+View(All.sps[tolook,])
+# Keep original species name for fuzzy matches greater than 3
+rem <- newnames2$spec.name.ORIG[which(newnames2$Fuzzy.dist>3)]
+All.sps$newnames[which(All.sps$newnames %in% rem)] <- All.sps$Ori[which(All.sps$newnames %in% rem)]
+# Keep original species name for species not found
+All.sps$newnames[which(All.sps$newnames=="")] <- All.sps$Ori[which(All.sps$newnames=="")]
+All.sps$newnames[which(All.sps$newnames=="NULL")] <- All.sps$Ori[which(All.sps$newnames=="NULL")]
+# This is the final species list
+any(is.na(All.sps$newnames))
+any(is.null(All.sps$newnames))
+any(All.sps$newnames=="")
+
+rownames(All.sps) <- All.sps$Ori
+
+```
+
+## After resolving species names
+```{r sp_in_common_after, eval=FALSE, message=FALSE, warning=FALSE}
+
+sp.ranges2 <- na.omit(unique(All.sps$newnames[which(All.sps$Ori %in% sp.ranges)]))
+sp.phy2 <- na.omit(unique(All.sps$newnames[which(All.sps$Ori %in% sp.phy)]))
+sp.traits2 <- na.omit(unique(All.sps$newnames[which(All.sps$Ori %in% sp.traits)]))
+
+Ns <- list(Range = sp.ranges2, Phylogeny = sp.phy2, Trait = sp.traits2)
+names(Ns) <- c(paste("Range\n(", length(sp.ranges2),")",sep = ""), 
+               paste("Phylogeny\n(", length(sp.phy2),")",sep = ""), 
+               paste("Trait\n(", length(sp.traits2),")",sep = ""))
+
+ggvenn(Ns, stroke_size = 0.5, set_name_size = 4)
+
+spincommon1 <- na.omit(unlist(Reduce(intersect, list(sp.ranges,sp.phy,sp.traits))))
+spincommon2 <- na.omit(unlist(Reduce(intersect, list(sp.ranges2,sp.phy2,sp.traits2))))
+
+# fix errors for sps in common
+spincommon2 <- gsub(" ","_",spincommon2)
+spincommon2 <- spincommon2[-which(spincommon2=="_")]
+spincommon2 <- spincommon2[-which(spincommon2=="NA_NA")]
+
+```
+
+Resolving species resulted in an addition of 409 species (Before = `r length(spincommon1)`, After = `r length(spincommon2)`) in commom among the three datasets (range, traits and phy). 
+
+## Subset datasets for species in common
+I used species with at least one trait record.
+```{r sp_in_common_sub, eval=FALSE, message=FALSE, warning=FALSE}
+
+# subset phy
+newphynames <- All.sps[sp.phy,]$newnames
+
+# Fix names
+newphy <- pblapply(phy, function(x) { 
+  x$tip.label <- newphynames 
+  x })
+
+ncores <- detectCores()-2
+cl <- makeCluster(ncores)
+clusterExport(cl, c("newphy", "spincommon2", "keep.tip"))
+newphy <- pblapply(newphy, function(x) keep.tip(x, spincommon2),
+                   cl = cl)
+stopCluster(cl)
+                   
+# subset traits
+newtraitsnames <- All.sps[sp.traits,]$newnames
+newtraits <- traits
+newtraits$sps <- newtraitsnames
+newtraits <- newtraits[which(newtraitsnames %in% spincommon2),]
+newtraits <- newtraits[-which(duplicated(newtraits$sps)),]
+
+# subset range data
+newspnames <- All.sps[plants$sps,]$newnames
+newplants <- plants
+newplants$sps <- newspnames
+newplants <- newplants[which(newspnames %in% spincommon2),]
+
+# test
+length(newphy[[1]]$tip.label)
+length(newtraits$sps)
+length(unique(newplants$sps))
+
+```
+
+# Imput missing traits
+Because many taxa were missing some observations of certain variables, two phylogenetic gap‐filling approaches were used to estimate missing values. First, imputation was performed for a fraction of taxa that were present in the occurrence data and the phylogenetic tree, but not present in the trait data (`r length(which(!sp.traits %in% sp.work))/length(sp.work)` species).
+
+To estimate trait values for species lacking such data, we ran phylogenetic imputation using the R-package Rphylopars (Goolsby et al. 2017) with a Brownian motion evolutionary model and took the median value from the 100 phylogenetic trees.
+```{r Rphylopars, eval=FALSE, message=FALSE, warning=FALSE}
+
+# 100 imputations >> one per phylogeny
+# I was havind issues trying to run phylopars on this dataset:
+# Error in tp(L = X, R = R, Rmat = as.matrix(Rmat), mL = ncol(X), mR = 1,  : 
+# Not compatible with requested type: [type=character; target=double].
+# Googling this error, I found this issue at the phylopars github >> https://github.com/ericgoolsby/Rphylopars/issues/21
+# The workaround for the error follows:
+# DO NOT RUN (JUST AN EXAMPLE)
+# tmp_tree <- newphy[[1]]
+# tmp_tree$edge.length[which(tmp_tree$edge.length<0.0001)]=0.0001
+
+# save files for oppening/running in the cluster
+saveRDS(newphy, "R/Cluster/Imputation/phy_plants.RDS")
+saveRDS(newtraits, "R/Cluster/Imputation/traits_plants.RDS")
+
+# Run in cluster
+
+# Load imputed files
+traitsmean <- readRDS("R/Cluster/Imputation/traitsmean.RDS")
+
+# compare summary values of imputed vs raw traits
+summary(newtraits[,-1])
+summary(exp(traitsmean)) # exponention because traits were log-transformed for imputation. Exp transforms log back to normal values.
+
+# correlation among traits
+cor1 <- cor(data.frame(newtraits[,-1]), use = "complete.obs")
+cor2 <- cor(exp(traitsmean))
+cor1
+cor2
+cor1 - cor2
+
+```
+
+# Save data
+```{r saveData, echo=TRUE, message=FALSE, warning=FALSE}
+
+saveRDS(newplants, "Data/WorkData/plants.RDS")
+saveRDS(traitsmean, "Data/WorkData/traitsmean.RDS")
+saveRDS(newphy, "Data/WorkData/newphy.RDS")
+
+```
+
+# Save
+```{r save, echo=TRUE, message=FALSE, warning=FALSE}
+save.image("R/FixData.RData")
+```
