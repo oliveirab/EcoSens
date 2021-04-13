@@ -16,13 +16,13 @@ output:
 ```{r packages, message=FALSE, include=FALSE}
 rm(list=ls())
 gc()
-
+ 
 # library(devtools)
 # install_github("jslefche/piecewiseSEM@devel", build_vignette = TRUE)
-
+ 
 # install.packages("BiocManager")
 # BiocManager::install("Rgraphviz")
-
+ 
 # Must use DiagrammeR v0.6
 # require(devtools)
 # install_version("DiagrammeR", version = "0.6", repos = "http://cran.us.r-project.org")
