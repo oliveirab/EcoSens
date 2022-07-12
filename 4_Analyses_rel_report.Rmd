@@ -1,0 +1,2704 @@
+---
+title: "Biodiversity mediates ecosystem sensitivity to climate variability"
+author: "Brunno F. Oliveira & Xiaoli Dong"
+date: "Document last time updated on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide 
+params:
+  woody: F
+---
+
+*** 
+
+\newpage
+
+# Setup
+```{r packages, message=FALSE, include=FALSE}
+ 
+rm(list=ls()) 
+gc()
+
+# install.packages("BiocManager")
+# BiocManager::install("Rgraphviz")
+
+# Must use DiagrammeR v0.6
+# require(devtools)
+# install_version("DiagrammeR", version = "0.6", repos = "http://cran.us.r-project.org")
+
+list.of.packages <- c("raster","maps","nlme","spdep","rgdal","viridis","ggplot2","rworldmap","gridExtra","cowplot","effects","PerformanceAnalytics","classInt","reshape2","scales","modEvA","dplyr","foreach","doParallel","pbapply","maptools","tidyr","ggridges","tidyverse","egg","grid","stickylabeller","ggpubr","mobr","Rarefy")
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+
+if(length(new.packages)) install.packages(new.packages)
+
+sapply(list.of.packages, require, character.only = TRUE)
+
+```
+
+
+```{r info, message=FALSE, include=FALSE}
+info <- sessionInfo()
+```
+
+This document was created using `r info$R.version$version.string` and the following packages:   
+
+```{r packs, message=FALSE}
+DT::datatable(data.frame(Package = unlist(lapply(info$otherPkgs, function(x) x$Package)), 
+                         Version = unlist(lapply(info$otherPkgs, function(x) x$Version))),
+              rownames = FALSE,
+              options = list(dom = 't'))
+```
+
+# land data
+```{r land, eval=T, message=FALSE, warning=FALSE, include=FALSE}
+
+land <- readOGR("Data/WE_contour.shp")
+crs(land) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+# project to equal area
+land <- spTransform(land, CRS("+proj=moll +datum=WGS84"))
+
+land2 <- sf::st_read("Data/WE_contour.shp")
+# project to equal area
+land2 <- st_transform(land2, crs("+proj=moll +datum=WGS84"))
+
+# crop shp
+crop. <- getMap(resolution = "coarse")
+crop. <- subset(crop., continent == "South America"|continent == "North America")
+crs(crop.) <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+
+# create a reference projection raster in a longlat projection and 0.5x0.5 degree resolution
+reso <- 0.5
+mod.r <- raster(xmn = -180, xmx = 180, ymn = -60, ymx = 90,
+                crs = CRS("+proj=longlat +datum=WGS84"))
+res(mod.r) <- reso
+
+```
+
+# Load data
+```{r loadData2, echo=TRUE, message=FALSE, warning=FALSE}
+
+data(params)
+
+dataset <- readRDS("Data/WorkData/dataset.RDS")
+
+# if which to run analyses with woody plants only
+if(params$woody){
+  dataset$rich <- dataset$richw
+  dataset$PD <- dataset$PDw
+  dataset$FRich <- dataset$FRichw
+}
+
+# get residuals from PD FD relatioship
+dataset$PDFDres <- resid(lm(FRich~PD,dataset))
+
+# positive vs negative sensitivity
+dataset$sens.sea.temp.dir <- ifelse(dataset$sens.sea.temp > 0, "pos", "neg")
+dataset$sens.sea.prec.dir <- ifelse(dataset$sens.sea.prec > 0, "pos", "neg")
+
+dataset$sens2.temp.dir <- ifelse(dataset$sens2.temp > 0, "pos", "neg")
+dataset$sens2.prec.dir <- ifelse(dataset$sens2.prec > 0, "pos", "neg")
+
+# add absolute variables
+dataset$sens2.temp.abs <- abs(dataset$sens2.temp)
+dataset$sens.sea.temp.abs <- abs(dataset$sens.sea.temp)
+dataset$sens2.prec.abs <- abs(dataset$sens2.prec)
+dataset$sens.sea.prec.abs <- abs(dataset$sens.sea.prec)
+
+# Fix Biome names
+# remove mangroves because their small area 
+rem <- which(dataset$biome=="Mangroves")
+length(rem) # Mangroves = 8 cells
+dataset <- dataset[-rem,]
+
+dataset$biome <- gsub("Boreal Forests/Taiga","Taiga",dataset$biome)
+dataset$biome <- gsub("Flooded Grasslands & Savannas","Trop./Subtrop. Grasslands",dataset$biome)
+dataset$biome <- gsub("Montane Grasslands & Shrublands","Montane Grasslands",dataset$biome)
+dataset$biome <- gsub("Deserts & Xeric Shrublands","Deserts and Shrublands",dataset$biome)
+dataset$biome <- gsub("Mediterranean Forests, Woodlands & Scrub","Medit. Forests",dataset$biome)
+dataset$biome <- gsub("Temperate Grasslands, Savannas & Shrublands","Temp. Grasslands",dataset$biome)
+dataset$biome <- gsub("Temperate Conifer Forests","Temp. Conifer",dataset$biome)
+dataset$biome <- gsub("Temperate Broadleaf & Mixed Forests","Temp. Mixed Forest",dataset$biome)
+dataset$biome <- gsub("Tropical & Subtropical Grasslands, Savannas & Shrublands","Trop./Subtrop. Grasslands",dataset$biome)
+dataset$biome <- gsub("Tropical & Subtropical Coniferous Forests","Trop./Subtrop. Conifer",dataset$biome)
+dataset$biome <- gsub("Tropical & Subtropical Dry Broadleaf Forests","Trop./Subtrop. Dry Forests",dataset$biome)
+dataset$biome <- gsub("Tropical & Subtropical Moist Broadleaf Forests","Trop./Subtrop. Moist Forests",dataset$biome)
+
+# Sep desert North and Soulth
+# dataset$biome[which(dataset$biome == "Deserts" & dataset$y > 0)] <- "North Desert"
+# dataset$biome[which(dataset$biome == "Deserts" & dataset$y < 0)] <- "South Desert"
+# biome levels follow mean annual temperature
+biome.temp <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temp = mean(temp_sea, na.rm = T))
+biome.levels <- biome.temp$biome[order(biome.temp$Temp)]
+biome.levels <- na.omit(biome.levels)
+dataset$biome <- factor(dataset$biome, levels = biome.levels)
+
+
+# sensitivity temp vs prec
+sens2.temp2 <- dataset$sens2.temp
+# sens2.temp2[which(sens2.temp2<0)] <- 0
+sens2.prec2 <- dataset$sens2.prec
+# sens2.prec2[which(sens2.prec2<0)] <- 0
+sens2 <- sens2.temp2 - sens2.prec2
+# plot(rasterFromXYZ(data.frame(dataset[,1:2], sens2))>0)
+
+sens.sea.temp2 <- dataset$sens.sea.temp
+# sens.sea.temp2[which(sens.sea.temp2<0)] <- 0
+sens.sea.prec2 <- dataset$sens.sea.prec
+# sens.sea.prec2[which(sens.sea.prec2<0)] <- 0
+sens.sea <- sens.sea.temp2 - sens.sea.prec2
+# plot(rasterFromXYZ(data.frame(dataset[,1:2], sens.sea))>0)
+
+# water-limted vs energy-limited regions
+dataset$wtlim2 <- ifelse(sens2 < 0, "WaterLimited", "EnergyLimited")
+dataset$wtlim.sea <- ifelse(sens.sea < 0, "WaterLimited", "EnergyLimited")
+
+dataset$wtlim2 <- as.factor(dataset$wtlim2)
+dataset$wtlim.sea <- as.factor(dataset$wtlim.sea)
+
+wtlim_annual <- rasterFromXYZ(data.frame(dataset[,1:2], 
+                                         ifelse(dataset$wtlim2=="WaterLimited",1,0)))
+wtlim_sea <- rasterFromXYZ(data.frame(dataset[,1:2], 
+                                      ifelse(dataset$wtlim.sea=="WaterLimited",1,0)))
+
+# classify biomes to limitation
+biomlim <- dataset %>%
+  group_by(biome) %>%
+  summarise(lim2 = mean(sens2.prec - sens2.temp, na.rm = T),
+            lim.sea = mean(sens.sea.prec - sens.sea.temp, na.rm = T))
+biomlim$lim2 <- ifelse(biomlim$lim2 < 0, "Energy Limited", "Water Limited")
+biomlim$lim.sea <- ifelse(biomlim$lim.sea < 0, "Energy Limited", "Water Limited")
+
+dataset <- merge(dataset,biomlim,by="biome")
+
+# load rasters
+vars.ras <- readRDS("Data/WorkData/vars.ras.RDS")
+vars.ras$wtlim_annual <- wtlim_annual
+vars.ras$wtlim_sea <- wtlim_sea
+
+
+```
+
+# Validade richness data 
+Compare richness data calculated with range maps with richness within plot.
+Here, we use plots from SALVIAS.
+```{r}
+
+salvias <- readRDS("Data/SALVIAS.RDS")
+
+# get coordinates to plots
+pXY <-  salvias %>%
+  group_by(plot_name) %>%
+  summarise(x = unique(longitude),
+            y = unique(latitude))
+
+pXY = na.omit(pXY)
+
+# some XY in salvias are NA but information exists from plot name
+salvias = merge(salvias,pXY)
+
+# calc richness
+psalvias <- salvias %>%
+  group_by(plot_name) %>%
+  summarise(rich = length(unique(scrubbed_species_binomial)))
+
+# group
+psalvias = merge(psalvias,pXY)
+
+pXY = SpatialPointsDataFrame(pXY[,2:3],pXY)
+crs(pXY) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+pXY = spTransform(pXY, CRS("+proj=moll +datum=WGS84"))
+pXY@data[,2:3] <- pXY@coords
+
+rangerich = raster::extract(vars.ras$richw, pXY)
+
+plot((psalvias$rich),(rangerich))
+cor.test(log(psalvias$rich),log(rangerich))
+summary(lm(log(rangerich)~log(psalvias$rich)))
+
+# rarefaction
+st <- salvias %>%
+  group_by(plot_name,scrubbed_species_binomial) %>%
+  summarise(value = length(scrubbed_species_binomial))
+
+st <- st %>%
+  spread(scrubbed_species_binomial, value)
+st[is.na(st)] = 0
+
+rare_shannon<-rare_alpha(data.frame(st[,-1]),method="hill",random=99,
+                         mean=TRUE)
+
+plot(rare_shannon[,1], rangerich)
+
+# aggregate plots by distance
+# 1) create an empty raster
+mr <- vars.ras$richw
+# 2) create an unique ID for each cell 
+values(mr) <- 1:ncell(mr)
+# extract cell ID at each plot from salvias
+salvias.cell <- data.frame(salvias[,c("plot_name","scrubbed_species_binomial","x","y")])
+salvias.cell = SpatialPointsDataFrame(salvias.cell[,3:4],salvias.cell)
+crs(salvias.cell) <-"+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+salvias.cell = spTransform(salvias.cell, CRS("+proj=moll +datum=WGS84"))
+salvias.cell@data[,3:4] <- salvias.cell@coords
+# View(salvias.cell@data)
+cellXY <- raster::extract(mr,salvias.cell)
+salvias.cell <- data.frame(cellXY,salvias.cell@data)
+
+# calc richness per cell
+richcell <- salvias.cell %>%
+  group_by(cellXY) %>%
+  summarise(richcell = length(unique(scrubbed_species_binomial)),
+            N_plots = length(unique(plot_name)))
+
+# calc richness per plot
+richplot <- salvias.cell %>%
+  group_by(plot_name) %>%
+  summarise(richplot = length(unique(scrubbed_species_binomial)))
+
+# add XY
+richcell <- merge(richcell,salvias.cell[,c("x","y","cellXY")])
+richcell <- richcell[-which(duplicated(richcell$cellXY)),]
+
+richplot <- merge(richplot,salvias.cell[,c("x","y","plot_name")])
+richplot <- richplot[-which(duplicated(richplot$plot_name)),]
+
+# extract richness values from range maps
+richcell = SpatialPointsDataFrame(richcell[,4:5],richcell)
+richcell@data = data.frame(richcell@data,richranges=raster::extract(vars.ras$richw,richcell))
+
+richplot = SpatialPointsDataFrame(richplot[,3:4],richplot)
+richplot@data = data.frame(richplot@data,richranges=raster::extract(vars.ras$richw,richplot))
+
+# plot vs ranges
+plot(richplot~richranges,richplot@data)
+cor.test(richplot@data$richplot,richplot@data$richranges)
+
+# cell vs ranges
+plot(richcell~richranges,richcell@data)
+cor.test(richcell@data$richcell,richcell@data$richranges)
+
+# log-transforming
+# plot vs ranges
+cor.test(log(richplot@data$richplot),log(richplot@data$richranges))
+
+plot(log(richplot)~log(richranges),richplot@data)
+m.plot = lm(log(richplot)~log(richranges),richplot@data)
+abline(m.plot)
+summary(m.plot)
+
+# cell vs ranges
+cor.test(log(richcell@data$richcell),log(richcell@data$richranges))
+
+plot(log(richcell)~log(richranges),richcell@data)
+m.plot = lm(log(richcell)~log(richranges),richcell@data)
+abline(m.plot)
+summary(m.plot)
+
+# for cell dataset, consider only cells with >=4 plots
+ndata = richcell@data
+ndata = ndata[which(ndata$N_plots>=4),]
+
+plot(log(richcell)~log(richranges),ndata)
+m.plot = lm(log(richcell)~log(richranges),ndata)
+abline(m.plot)
+summary(m.plot)
+
+{
+  # png("Figs/Supp_richplots.png", width = 800, height = 400)
+  par(mfrow=c(1,2))
+  plot(land)
+  points(ndata[,4:5],add=T, col = "red",pch=19)
+  plot(log(richcell)~log(richranges),ndata,
+       xlab="Species richness from range maps",
+       ylab="Species richness from plots")
+  abline(m.plot,col="red")
+  # dev.off()
+}
+
+
+
+```
+
+
+
+# Load functions
+```{r load.fun, eval=T, message=FALSE, warning=FALSE, include=FALSE}
+
+chart.Correlation.linear <-
+  function (R, histogram = TRUE, method=c("pearson", "kendall", "spearman"), ...)
+  { # @author R Development Core Team
+    # @author modified by Peter Carl & Marek Lahoda
+    # Visualization of a Correlation Matrix. On top the (absolute) value of the correlation plus the result 
+    # of the cor.test as stars. On botttom, the bivariate scatterplots, with a linear regression fit. 
+    # On diagonal, the histograms with probability, density and normal density (gaussian) distribution.
+
+    x = checkData(R, method="matrix")
+
+    if(missing(method)) method=method[1] #only use one
+    cormeth <- method
+
+    # Published at http://addictedtor.free.fr/graphiques/sources/source_137.R
+    panel.cor <- function(x, y, digits=2, prefix="", use="pairwise.complete.obs", method=cormeth, cex.cor, ...)
+    {
+      usr <- par("usr"); on.exit(par(usr))
+      par(usr = c(0, 1, 0, 1))
+      r <- cor(x, y, use=use, method=method) # MG: remove abs here
+      txt <- format(c(r, 0.123456789), digits=digits)[1]
+      txt <- paste(prefix, txt, sep="")
+      if(missing(cex.cor)) cex <- 0.8/strwidth(txt)
+
+      test <- cor.test(as.numeric(x),as.numeric(y), method=method)
+      # borrowed from printCoefmat
+      Signif <- symnum(test$p.value, corr = FALSE, na = FALSE,
+                       cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                       symbols = c("***", "**", "*", ".", " "))
+      # MG: add abs here and also include a 30% buffer for small numbers
+      text(0.5, 0.5, txt, cex = cex * (abs(r) + .3) / 1.3)
+      text(.8, .8, Signif, cex=cex, col=2)
+    }
+
+    #remove method from dotargs
+    dotargs <- list(...)
+    dotargs$method <- NULL
+    rm(method)
+
+    hist.panel = function (x, ...=NULL ) {
+      par(new = TRUE)
+      hist(x,
+           col = "light gray",
+           probability = TRUE,
+           axes = FALSE,
+           main = "",
+           breaks = "FD")
+      lines(density(x, na.rm=TRUE),
+            col = "red",
+            lwd = 1)
+      # adding line representing density of normal distribution with parameters correponding to estimates of mean and standard deviation from the data 
+      ax.x = seq(min(x), max(x), 0.1)                                                  # ax.x containts points corresponding to data range on x axis
+      density.est = dnorm(ax.x, mean = mean(x), sd = sd(x))   # density corresponding to points stored in vector ax.x 
+      lines(ax.x, density.est, col = "blue", lwd = 1, lty = 1)                                # adding line representing density into histogram
+      rug(x)
+    }
+
+    # Linear regression line fit over points
+    reg <- function(x, y, ...) {
+      points(x,y, ...)
+      abline(lm(y~x), col = "red") 
+    }
+
+    # Draw the chart
+    if(histogram)
+      pairs(x, gap=0, lower.panel=reg, upper.panel=panel.cor, diag.panel=hist.panel)
+    else
+      pairs(x, gap=0, lower.panel=reg, upper.panel=panel.cor) 
+  }
+
+tag_facet_flex <- function(p, position = 'both', 
+                           open = c("(", ""), close = c(")", ")"),
+                           tag_fun_top = function(i) letters[i],
+                           tag_fun_right = utils::as.roman,
+                           x = c(0, 0), y = c(0.5, 1),
+                           hjust = c(0, 0), vjust = c(0.5, 1),
+                           fontface = c(1, 1), ...) {
+  
+  gb <- ggplot_build(p)
+  lay <- gb$layout$layout  
+  
+  if (grepl(position, 'top')) {
+    
+    lay <- gb$layout$layout
+    
+    tags_top <- paste0(open[1], tag_fun_top(unique(lay$COL)), close[1])
+    
+    tl <- lapply(tags_top, grid::textGrob,
+                 x = x[1], y = y[1],
+                 hjust = hjust[1], vjust = vjust[1], 
+                 gp = grid::gpar(fontface = fontface[1], ...)
+    )
+    
+    g <- ggplot_gtable(gb)
+    g <- gtable::gtable_add_rows(g, grid::unit(1, "line"), pos = 0)
+    lm <- unique(g$layout[grepl("panel", g$layout$name), "l"])
+    g <- gtable::gtable_add_grob(g, grobs = tl, t = 1, l = lm)
+    
+  } else if (grepl(position, 'right')) {
+    
+    tags_right <- paste0(open[2], tag_fun_right(unique(lay$ROW)), close[2])
+    
+    rl <- lapply(tags_right, grid::textGrob,
+                 x = x[2], y = y[2],
+                 hjust = hjust[2], vjust = vjust[2], 
+                 gp = grid::gpar(fontface = fontface[2], ...)
+    )
+    
+    g <- ggplot_gtable(gb)
+    l <- unique(g$layout[grepl("panel", g$layout$name), "l"])
+    
+    wm <- do.call(grid::unit.pmax, lapply(rl, grid::grobWidth))
+    g <- gtable::gtable_add_cols(g, wm, pos = max(l))
+    t <- unique(g$layout[grepl("panel", g$layout$name), "t"])
+    g <- gtable::gtable_add_grob(g, grobs = rl, t = t, l = max(l) + 1)
+    g <- gtable::gtable_add_cols(g, unit(2, "mm"), pos = max(l))
+    
+  } else {
+    
+    print('Use default tagging option: both top and right sides')
+    
+    tags_top <- paste0(open[1], tag_fun_top(unique(lay$COL)), close[1])
+    tags_right <- paste0(open[2], tag_fun_right(unique(lay$ROW)), close[2])
+    
+    tl <- lapply(tags_top, grid::textGrob,
+                 x = x[1], y = y[1],
+                 hjust = hjust[1], vjust = vjust[1], 
+                 gp = grid::gpar(fontface = fontface[1], ...)
+    )
+    
+    rl <- lapply(tags_right, grid::textGrob,
+                 x = x[2], y = y[2],
+                 hjust = hjust[2], vjust = vjust[2], 
+                 gp = grid::gpar(fontface = fontface[2], ...)
+    )
+    
+    g <- ggplot_gtable(gb)
+    g <- gtable::gtable_add_rows(g, grid::unit(1, "line"), pos = 0)
+    l <- unique(g$layout[grepl("panel", g$layout$name), "l"])
+    g <- gtable::gtable_add_grob(g, grobs = tl, t = 1, l = l)
+    
+    wm <- do.call(grid::unit.pmax, lapply(rl, grid::grobWidth))
+    g <- gtable::gtable_add_cols(g, wm, pos = max(l))
+    t <- unique(g$layout[grepl("panel", g$layout$name), "t"])
+    g <- gtable::gtable_add_grob(g, grobs = rl, t = t, l = max(l) + 1)
+    g <- gtable::gtable_add_cols(g, unit(2, "mm"), pos = max(l))
+  }
+  
+  if (!is.null(g)) {
+    grid::grid.newpage()
+    grid::grid.draw(g)    
+  }
+  
+  return(g)
+  
+}
+
+myramp <- colorRampPalette(c("#D6604D", "#F7F7F7", "#4393C3"))
+
+#extract legend
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+
+# My map
+mymap <- function(ras, labs, breaks, main, colramp = colorRampPalette(c("#D6604D", "#F7F7F7", "#4393C3")), invert = F, plotpos = c(0.1,0.12, 0.02,0.3)){
+  
+  if(invert){
+    plot(ras, main = main, 
+         axes=F, box=F, breaks = breaks, legend = F,
+         col=rev(colramp(length(breaks))))
+    # legend
+    plot(ras,  axis.args=list(at=labs, labels=labs), 
+         breaks = breaks, legend.only = T,
+         col=rev(colramp(length(breaks))), smallplot=plotpos)
+  }
+  else{
+    plot(ras, main = main, 
+         axes=F, box=F, breaks = breaks, legend = F,
+         col=colramp(length(breaks)))
+    # legend
+    plot(ras,  axis.args=list(at=labs, labels=labs), 
+         breaks = breaks, legend.only = T,
+         col=colramp(length(breaks)), smallplot=plotpos)
+  }
+  
+  plot(land, add=T, cex = .6)
+}
+
+
+# Get class intervals
+getClassInt <- function(x, classes = 21, center = NULL){
+  if(!is.null(center)){
+    if((classes %% 2) == 0){ # test if number is even
+      print("Classes is a even number! When centering, the number of classes has to be an odd number.")
+      break
+    }
+  }
+  #
+  tmp <- na.omit(getValues(x))
+  if(is.numeric(tmp)){
+    tmp[is.infinite(tmp)] <- NA
+    if(is.null(center)){
+      class_int <- BAMMtools::getJenksBreaks(tmp, classes)
+      class_int[1] <- min(tmp, na.rm = T)
+      class_int[classes] <- max(tmp, na.rm = T)
+    }
+    if(!is.null(center)){
+      class_neg <-  BAMMtools::getJenksBreaks(tmp[which(tmp<0)], (classes-1)/2)
+      class_pos <-  BAMMtools::getJenksBreaks(tmp[which(tmp>0)], (classes-1)/2)
+      class_int <- c(class_neg, center, class_pos)
+      class_int[1] <- min(tmp, na.rm = T)
+      class_int[classes] <- max(tmp, na.rm = T)
+    }
+    # avoid identical breaks
+    return(unique(class_int))
+  }
+  else{
+    return(NA)
+  }
+}
+
+#### Bivariate maps
+#function to generate bivariate maps. Copy and paste that into R:
+# The function that produces the colour matrix
+colmat<-function(nquantiles=10, 
+                 lims = c(0,1),
+                 upperleft=rgb(0,150,235, maxColorValue=255), 
+                 upperright=rgb(130,0,80, maxColorValue=255), 
+                 bottomleft="grey", bottomright=rgb(255,230,15, maxColorValue=255), 
+                 xlab="x label", ylab="y label",
+                 cex=0.5,cex.lab=1.3,cex.axis=1,
+                 .plot=T){
+  my.data<-seq(0,1,.01)
+  my.class<-classIntervals(my.data,n=nquantiles,style="quantile")
+  my.pal.1<-findColours(my.class,c(upperleft,bottomleft))
+  my.pal.2<-findColours(my.class,c(upperright, bottomright))
+  col.matrix<-matrix(nrow = 101, ncol = 101, NA)
+  for(i in 1:101){
+    my.col<-c(paste(my.pal.1[i]),paste(my.pal.2[i]))
+    col.matrix[102-i,]<-findColours(my.class,my.col)}
+  if(.plot==T){
+    plot(c(1,1),pch=19,col=NULL, xlim=c(0,1),ylim=c(0,1),
+         axes=F, xlab="", ylab="")
+    for(i in 1:101){
+      col.temp<-col.matrix[i-1,]
+      points(my.data,rep((i-1)/100,101),pch=15,col=col.temp, cex=cex)}}
+  par(new=TRUE)
+  plot(c(1,1),pch=19,col=NULL, cex=cex, cex.axis=cex.axis, 
+       xlim=lims,ylim=lims,frame.plot=F, xlab=xlab, ylab=ylab,cex.lab=cex.lab)
+  
+  seqs<-seq(0,100,(100/nquantiles))
+  seqs[1]<-1
+  col.matrix <- col.matrix[c(seqs), c(seqs)]}
+
+
+
+# Function to assign colour-codes to raster data
+# As before, by default assign tercile breaks
+bivariate.map <- function(rasterx, rastery, colormatrix = col.matrix,
+                          nquantiles = 3, style = "quantile",
+                          outname = paste0("colMatrix_rasValues", names(rasterx))) {
+  # export.colour.matrix will export a data.frame of rastervalues and RGB codes 
+  # to the global environment outname defines the name of the data.frame
+  quanmean <- getValues(rasterx)
+  temp <- data.frame(quanmean, quantile = rep(NA, length(quanmean)))
+  brks <- classInt::classIntervals(quanmean,
+                                   n = nquantiles,
+                                   style = style )
+  brks <- brks$brks
+  
+  ## Add (very) small amount of noise to all but the first break
+  ## https://stackoverflow.com/a/19846365/1710632
+  brks[-1] <- brks[-1] + seq_along(brks[-1]) * .Machine$double.eps
+  r1 <- within(temp, quantile <- cut(quanmean,
+                                     breaks = brks,
+                                     labels = 2:length(brks),
+                                     include.lowest = TRUE
+  ))
+  quantr <- data.frame(r1[, 2])
+  quanvar <- getValues(rastery)
+  temp <- data.frame(quanvar, quantile = rep(NA, length(quanvar)))
+  brks <- classInt::classIntervals(quanvar,
+                                   n = nquantiles,
+                                   style = style )
+  brks <- brks$brks
+  
+  brks[-1] <- brks[-1] + seq_along(brks[-1]) * .Machine$double.eps
+  r2 <- within(temp, quantile <- cut(quanvar,
+                                     breaks = brks,
+                                     labels = 2:length(brks),
+                                     include.lowest = TRUE
+  ))
+  quantr2 <- data.frame(r2[, 2])
+  as.numeric.factor <- function(x) {
+    as.numeric(levels(x))[x]
+  }
+  col.matrix2 <- colormatrix
+  cn <- unique(colormatrix)
+  for (i in 1:length(col.matrix2)) {
+    ifelse(is.na(col.matrix2[i]),
+           col.matrix2[i] <- 1, col.matrix2[i] <- which(
+             col.matrix2[i] == cn
+           )[1]
+    )
+  }
+  
+  cols <- numeric(length(quantr[, 1]))
+  for (i in 1:length(quantr[, 1])) {
+    a <- as.numeric.factor(quantr[i, 1])
+    b <- as.numeric.factor(quantr2[i, 1])
+    cols[i] <- as.numeric(col.matrix2[b, a])
+  }
+  r <- rasterx
+  r[1:length(r)] <- cols
+  return(r)
+}
+
+
+
+#### function to get equal binds from a vector
+func_splint <- function(x,interval=4,dig.lab=5) {
+  require(ggplot2)
+  is.odd <- function(x) x %% 2 != 0
+  
+  a <- levels(cut_interval(x,interval-1,dig.lab=dig.lab))
+  b <- unlist(strsplit(a,','))
+  c <- gsub('[','',b,fixed="TRUE")
+  d <- gsub(']','',c,fixed="TRUE")
+  e <- gsub('(','',d,fixed="TRUE")
+  f <- gsub(')','',e,fixed="TRUE")
+  return(as.numeric(c(unique(f))))
+}
+
+# This function returns a dataframe with summary of sarmodels
+# x = list of sar models from which summary will be returned
+get.summary.models <- function(x){
+  
+  model.summary_ <- summary(x)
+  Ndf <- length(model.summary_$residuals)
+  model.summary_ <- model.summary_$Coef[-1,c(1,2,4)]
+  
+  model.confint <- data.frame(confint(x))
+  model.confint <- model.confint[-which(grepl("Intercept",rownames(model.confint))),]
+  if(length(which(grepl("lambda", rownames(model.confint))))>0){
+    model.confint <- model.confint[-which(grepl("lambda",rownames(model.confint))),]
+  }
+  
+  names(model.confint) <- c("Lower_IC","Higher_IC")
+  
+  model.summary_ <- cbind(model.summary_,model.confint)
+  
+  model.summary_$sig <- ifelse(model.summary_$`Pr(>|z|)`<0.05,1,0)
+  model.summary_$var <- rownames(model.summary_)
+  model.summary_$AIC <- AIC(x)
+  model.summary_$Ndf <- Ndf
+  
+  rownames(model.summary_) <- NULL
+  return(model.summary_)
+}
+
+
+```
+
+
+# Fix raster
+```{r getJenksBreaks, eval=T, warning=FALSE, include=FALSE}
+
+# Set break 0 for sensitivity, trend and SES metrics
+sensmetrics <- names(vars.ras)[grep("sens",names(vars.ras))]
+sensmetrics <- sensmetrics[-grep("confint",sensmetrics)]
+sensmetrics <- sensmetrics[-grep(".N",sensmetrics)]
+sensmetrics <- sensmetrics[-grep(".P",sensmetrics)]
+sensmetrics <- sensmetrics[-grep("r2",sensmetrics)]
+
+SESmetrics <- c("PDses","FRichses")
+
+mymetrics <- c(sensmetrics,SESmetrics)
+
+cl <- makeCluster(20)
+clusterExport(cl, c("vars.ras", "getClassInt", "getValues", "mymetrics"))
+class_int <- pblapply(1:nlayers(vars.ras), function(x) 
+  if(names(vars.ras)[x] %in% mymetrics){
+    getClassInt(vars.ras[[x]], center = 0)
+  }
+  else{
+    getClassInt(vars.ras[[x]])
+  }, 
+  cl = cl)
+stopCluster(cl)
+names(class_int) <- names(vars.ras)
+
+```
+
+# Explore variables
+
+## Sensitivity metrics
+
+Original metrics:
+sens1 = using monthly time-series
+sens.sea = detrended time-series
+sens2 = using mean annual time-series
+sens.cc = using monthly time-series and removing its seasonality component
+
+Relative (Constancy metrics)
+sens2.rel = sens2 - sens2.rel.max
+sens2.rel2 = sens2.rel.avg - sens2.rel.max
+sens.sea.rel = sens.sea - sens.sea.rel.max
+sens.sea.rel2 = sens.sea.rel.avg - sens.sea.rel.max
+
+### Correlations
+```{r cor_sens, message=FALSE, warning=FALSE, fig.height=10, fig.width=10}
+
+# original metrics
+my_data <- dataset[sample(1:nrow(dataset),1000), 
+                   c("sens1.temp","sens1.prec",
+                     "sens.sea.temp","sens.sea.prec",
+                     "sens2.temp","sens2.prec",
+                     "sens.cc.temp","sens.cc.prec")]
+chart.Correlation(my_data, histogram=TRUE, pch=19)
+
+# new (constancy) metrics
+my_data <- dataset[sample(1:nrow(dataset),1000), 
+                   c("sens2.rel.temp","sens2.rel.temp2",
+                     "sens2.rel.temp.abs", "sens2.rel.temp.abs2",
+                     "sens2.rel.temp.sd",
+                     "sens2.rel.prec","sens2.rel.prec2",
+                     "sens2.rel.prec.abs", "sens2.rel.prec.abs2",
+                     "sens2.rel.prec.sd")]
+chart.Correlation(my_data, histogram=TRUE, pch=19)  
+
+# new (constancy) metrics
+my_data <- dataset[sample(1:nrow(dataset),1000), 
+                   c("sens.sea.rel.temp","sens.sea.rel.temp2",
+                     "sens.sea.rel.temp.abs", "sens.sea.rel.temp.abs2",
+                     "sens.sea.rel.temp.sd",
+                     "sens.sea.rel.prec","sens.sea.rel.prec2",
+                     "sens.sea.rel.prec.abs", "sens.sea.rel.prec.abs2",
+                     "sens.sea.rel.prec.sd")]
+chart.Correlation(my_data, histogram=TRUE, pch=19)  
+
+
+```
+
+There are strong correlation between variables representing the sensitivities to seasonality and climate change. I decided to use sens.sea to represent sensitivity to seasonality because it removes the trend component, and sens2 to represent sensitive to climate change because it represents changes in mean annual states and because sens.cc contains lots of noise of the seasonality change across years.
+
+### Violin plots
+```{r Sensitivity_violin, fig.height=5, fig.width=6, message=FALSE, warning=FALSE}
+
+data.tmp1 <- dataset[,c("biome","sens2.temp","sens2.prec")]
+names(data.tmp1) <- c("Biome", "Temperature", "Precipitation")
+data.tmp1 <- melt(data.tmp1, id.vars = "Biome")
+
+ggplot(na.omit(data.tmp1), aes(x = variable, y = value, color = variable)) +
+  geom_jitter(alpha=.05)+
+  geom_violin(alpha=.5) +
+  coord_flip()+
+  ylab("Sensitivity interannual")+xlab("")+
+  theme_classic()+
+  geom_hline(yintercept = 0)+
+  facet_wrap(Biome~.,ncol = 3)+theme(legend.position="none")
+
+data.tmp2 <- dataset[,c("biome","sens.sea.temp","sens.sea.prec")]
+names(data.tmp2) <- c("Biome", "Temperature", "Precipitation")
+data.tmp2 <- melt(data.tmp2, id.vars = "Biome")
+
+ggplot(na.omit(data.tmp2), aes(x = variable, y = value, color = variable)) +
+  geom_jitter(alpha=.05)+
+  geom_violin(alpha=.5) +
+  coord_flip()+
+  ylab("Sensitivity to seasonality")+xlab("")+
+  theme_classic()+
+  geom_hline(yintercept = 0)+
+  facet_wrap(Biome~.,ncol = 1)+theme(legend.position="none")
+
+data.tmp3 <- rbind(data.frame(data.tmp1, scale = "Interannual"),
+                   data.frame(data.tmp2, scale = "Seasonal"))
+data.tmp3$scale <- gsub("Interannual", "Inter-annual",
+                        data.tmp3$scale)
+data.tmp3$Biome <- factor(data.tmp3$Biome, 
+                          levels = rev(levels(data.tmp3$Biome)))
+
+{
+  pdf("Figs/Supp_sens_biomes.pdf", width = 6, height = 5)
+  ggplot(na.omit(data.tmp3), aes(x = value, y = Biome, 
+                                 color = variable, fill = variable)) +
+    geom_density_ridges(alpha=.5) +
+    ylab("")+xlab("Ecosystem sensitivity")+
+    theme_minimal()+
+    theme(strip.background  = element_blank(),
+          legend.position="bottom",
+          strip.text=element_text(face = "bold"))+
+    geom_vline(xintercept = 0, linetype="dotted")+
+    facet_wrap(scale~., ncol = 2, labeller = label_glue('{scale}'))+
+    guides(color=guide_legend(title=""),
+           fill=guide_legend(title=""))
+  dev.off()
+}
+
+
+```
+
+
+
+### Maps
+
+#### Sensitivity patterns
+```{r Sensitivity_geo, fig.height=3.5*2, fig.width=2.666*2, message=FALSE, warning=FALSE}
+
+{
+  # pdf("Figs/sens.pdf", height = 3.5*2, width = 2.666*2)
+  
+  par(mfrow=c(2,2), 
+      mar=c(0,0,1,0))
+  
+  # Sensitivity temperature
+  mymap(ras = vars.ras$sens.sea.temp, 
+        labs = round(func_splint(class_int$sens.sea.temp, 5),3),
+        breaks = class_int$sens.sea.temp,
+        invert = T)
+  labelFig('a',cex = 2,adj=0)
+  
+  # Sensitivity precipitation
+  mymap(ras = vars.ras$sens.sea.prec, 
+        labs = round(func_splint(class_int$sens.sea.prec, 5),3),
+        breaks = class_int$sens.sea.prec,
+        invert = T)
+  labelFig('b',cex = 2,adj=0)
+  
+  # Sensitivity temperature
+  mymap(ras = vars.ras$sens2.temp, 
+        labs = round(func_splint(class_int$sens2.temp, 5),3),
+        breaks = class_int$sens2.temp,
+        invert = T)
+  labelFig('c',cex = 2,adj=0)
+  
+  # Sensitivity precipitation
+  mymap(ras = vars.ras$sens2.prec, 
+        labs = round(func_splint(class_int$sens2.prec, 5),3),
+        breaks = class_int$sens2.prec,
+        invert = T)
+  labelFig('d',cex = 2,adj=0)
+  
+  # dev.off()
+}
+
+ggplot() +
+  geom_sf(data = land2, fill = "lightgray", color = NA)+
+  geom_raster(data = dataset ,
+              aes(x = x, y = y,
+                  fill = sens2.prec)) +
+  geom_sf(data = land2, fill = NA, size = .2, color = "black")+
+  coord_sf()+
+  scale_fill_gradient2(low = "#D6604D", mid = "#F7F7F7",high = "#4393C3") +
+  theme_map()+
+  theme(legend.position = c(0.1, 0.2))
+
+```
+
+(***) represents a significant pattern
+```{r Sensitivity_sig, fig.height=3.5*2, fig.width=2.666*2, message=FALSE, warning=FALSE}
+
+{
+  # x11(width = 7, height = 4)
+  
+  par(mfrow=c(2,2), 
+      mar=c(0,0,1,0))
+  
+  # Sensitivity temperature
+  mymap(ras = raster::mask(vars.ras$sens.sea.temp, vars.ras$sens.sea.temp.P <= .05, maskvalue = 0), 
+        labs = round(func_splint(class_int$sens.sea.temp, 5),3),
+        breaks = class_int$sens.sea.temp,
+        invert = T)
+  
+  # Sensitivity precipitation
+  mymap(ras = raster::mask(vars.ras$sens.sea.prec, vars.ras$sens.sea.prec.P <= .05, maskvalue = 0), 
+        labs = round(func_splint(class_int$sens.sea.prec, 5),3),
+        breaks = class_int$sens.sea.prec,
+        invert = T)
+  
+  # Sensitivity temperature
+  mymap(ras = raster::mask(vars.ras$sens2.temp, vars.ras$sens2.temp.P <= .05, maskvalue = 0), 
+        labs = round(func_splint(class_int$sens2.temp, 5),3),
+        breaks = class_int$sens2.temp,
+        invert = T)
+  
+  # Sensitivity precipitation
+  mymap(ras = raster::mask(vars.ras$sens2.prec, vars.ras$sens2.prec.P <= .05, maskvalue = 0), 
+        labs = round(func_splint(class_int$sens2.prec, 5),3),
+        breaks = class_int$sens2.prec,
+        invert = T)
+  
+}
+
+```
+
+
+
+### Bivariate plot
+Ecosystem sensitivity to temperature and precipitation varied widely across the globe. Areas of high sensitivity to precipitation seasonality concentrate in arid regions, whereas areas of high sensitivity to temperature seasonality concentrate in temperate regions. Areas of high sensitivity to ongoing precipitation and temperature changes also concentrate in arid regions, but the effect of temperature change is greater at the temperate zone.
+
+```{r bivsens, message=FALSE, warning=FALSE, fig.height=5, fig.width=9}
+col.matrix <- colmat(nquantiles=5,
+                     upperleft="#F58439",
+                     upperright="#A43E96",
+                     bottomleft="snow",
+                     bottomright="#007DC4",
+                     xlab="Sensitivity to precipitation",
+                     ylab="Sensitivity to temperature")
+
+
+bivmap <- bivariate.map(vars.ras$sens.sea.prec, 
+                        vars.ras$sens.sea.temp,
+                        style = "hclust",
+                        colormatrix=col.matrix, nquantiles=5)
+
+bivmap2 <- bivariate.map(vars.ras$sens2.prec, 
+                         vars.ras$sens2.temp,
+                         style = "jenks",
+                         colormatrix=col.matrix, nquantiles=5)
+
+{
+  # pdf("Figs/sens_bivar.pdf",width = 9, height = 5)
+  par(mfrow=c(1,3),mai=c(0,0,1,0), mar=c(0,0,1,0))
+  plot(bivmap,
+       frame.plot=F, axes=F, box=F, legend=F, 
+       col=as.vector(col.matrix))
+  plot(land, add=T, cex = .6)
+  labelFig('a',cex = 2,adj=0)
+  
+  par(mai=c(0,0,1,0),mar=c(0,0,1,0))
+  plot(bivmap2, 
+       frame.plot=F, axes=F, box=F, legend=F, 
+       col=as.vector(col.matrix))
+  plot(land, add=T, cex = .6)
+  labelFig('b',cex = 2,adj=0)
+  
+  plot.new()
+  par(mex = .6, plt = c(.12, .63, 0.1, 0.4), new = TRUE)
+  colmat(nquantiles=5,
+         lims = c(-1,1),
+         upperleft="#F58439",
+         upperright="#A43E96",
+         bottomleft="snow",
+         bottomright="#007DC4",
+         xlab="Sensitivity to precipitation",
+         ylab="Sensitivity to temperature")
+  # dev.off()
+}
+
+
+dataplot <- dataset %>%
+  group_by(y) %>%
+  summarise(sens.sea.temp = mean(sens.sea.temp, na.rm = T),
+            sens.sea.prec = mean(sens.sea.prec, na.rm = T),
+            sens2.temp = mean(sens2.temp, na.rm = T),
+            sens2.prec = mean(sens2.prec, na.rm = T))
+
+p1 <- ggplot(dataset)+
+  geom_point(aes(x = y, y = sens.sea.temp, color = "red"), alpha = .02)+
+  geom_point(aes(x = y, y = sens.sea.prec, color = "blue"), alpha = .02)+
+  geom_smooth(aes(x = y, y = sens.sea.temp, color = "red"), 
+              method="gam", size = 1)+
+  geom_smooth(aes(x = y, y = sens.sea.prec, color = "blue"),
+              method="gam", size = 1)+
+  scale_color_manual(labels = c("Precipitation", "Temperature"), 
+                     values = c("blue", "red")) +
+  coord_flip(xlim = c(-6407967,7950533))+
+  xlab("Latitude") + ylab("Ecosystem sensitivity")+
+  theme_classic()+
+  theme(legend.position = "none")+
+  guides(color=guide_legend(title=""),
+         fill=guide_legend(title=""))
+
+p2 <- ggplot(dataset)+
+  geom_point(aes(x = y, y = sens2.temp, color = "red"), alpha = .02)+
+  geom_point(aes(x = y, y = sens2.prec, color = "blue"), alpha = .02)+
+  geom_smooth(aes(x = y, y = sens2.temp, color = "red"), 
+              method="gam", size = 1)+
+  geom_smooth(aes(x = y, y = sens2.prec, color = "blue"),
+              method="gam", size = 1)+
+  scale_color_manual(labels = c("Precipitation", "Temperature"), 
+                     values = c("blue", "red")) +
+  coord_flip(xlim = c(-6407967,7950533))+
+  xlab("Latitude") + ylab("Ecosystem sensitivity")+
+  theme_classic()+
+  theme(legend.position = "none")+
+  guides(color=guide_legend(title=""),
+         fill=guide_legend(title=""))
+
+
+# pdf("Figs/sens_latitude.pdf",width = 8, height = 4)
+grid.arrange(arrangeGrob(plot_grid(p1 + theme(legend.position="none"), 
+                                   p2 + theme(legend.position="none"),
+                                   labels = "auto", ncol = 2)),
+             g_legend(p1 + theme(legend.position="bottom")), 
+             nrow=2, heights=c(4, 1)) 
+# dev.off()
+
+
+```
+
+### Water-limited vs Energy-limited regions
+
+```{r WEL, message=FALSE, warning=FALSE, fig.height=3.5, fig.width=2.666*2}
+
+{
+  # x11(width = 7, height = 4)
+  
+  par(mfrow=c(1,2), 
+      mar=c(0,0,2,0))
+  
+  plot(vars.ras$wtlim_annual, main = "Annual", 
+       axes=F, box=F, labs = c(0,1), breaks = c(0,.5,1), legend = F,
+       col=myramp(2))
+  # legend
+  plot(vars.ras$wtlim_annual, legend.only = T,
+       col=myramp(2), labs = c(0, 1), breaks = c(0,.5,1),
+       smallplot=c(0.8,0.82, 0.02,0.3))
+  plot(land, add=T, cex = .6)
+  
+  plot(vars.ras$wtlim_sea, main = "Seasonal", 
+       axes=F, box=F, labs = c(0,1), breaks = c(0,.5,1), legend = F,
+       col=myramp(2))
+  # legend
+  plot(vars.ras$wtlim_sea, legend.only = T,
+       col=myramp(2), labs = c(0, 1), breaks = c(0,.5,1),
+       smallplot=c(0.8,0.82, 0.02,0.3))
+  plot(land, add=T, cex = .6)
+}
+
+```
+
+Blue cells represents water-limted regions, whereas red cells represent energy-limited regions.
+
+## Biodiversity metrics
+### Correlations biodiversity metrics
+```{r cor_bio, message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+my_data <- dataset[sample(1:nrow(dataset),1000),
+                   c("rich","PD","FRich","PDses","FRichses")]
+names(my_data) <- c("Rickness", "PD", "FD", "PD SES", "FD SES")
+chart.Correlation.linear(my_data, histogram=F)
+
+# Log transformed 
+chart.Correlation(log10(my_data), histogram=TRUE, pch=19)
+
+```
+
+### Maps
+
+```{r biotic.predictors, message=FALSE, warning=FALSE, fig.height=4, fig.width=10.5}
+
+### Richness metrics
+
+{
+  # x11(width = 10.5, height = 4)
+  
+  par(mfrow=c(1,3), 
+      mar=c(0,0,2,0))
+  
+  # Richness
+  mymap(ras = log10(vars.ras$rich), 
+        breaks = log10(class_int$rich),
+        labs = func_splint(log10(class_int$rich), 5, 3),
+        colramp = viridis_pal(),
+        main = "Log10 Richness")
+  
+  
+  # PD
+  mymap(ras = log10(vars.ras$PD), 
+        breaks = log10(class_int$PD),
+        labs = func_splint(log10(class_int$PD), 5, 3),
+        colramp = viridis_pal(),
+        main = "Log10 PD")
+  
+  # FD
+  mymap(ras = vars.ras$FRich, 
+        breaks = class_int$FRich,
+        labs = func_splint(class_int$FRich, 5, 3),
+        colramp = viridis_pal(),
+        main = "FRich")
+}
+
+{
+  # x11(width = 10.5, height = 4)
+  
+  par(mfrow=c(1,3), 
+      mar=c(0,0,2,0))
+  
+  # Richness
+  mymap(ras = vars.ras$rich, 
+        breaks = class_int$rich,
+        labs = func_splint(class_int$rich, 5, 3),
+        colramp = viridis_pal(),
+        main = "Log10 Richness")
+  
+  
+  # PD
+  mymap(ras = vars.ras$PDses, 
+        breaks = class_int$PDses,
+        labs = func_splint(class_int$PDses, 5, 3),
+        colramp = viridis_pal(),
+        main = "Log10 PD")
+  
+  # FD
+  mymap(ras = vars.ras$FRichses, 
+        breaks = class_int$FRichses,
+        labs = func_splint(class_int$FRichses, 5, 3),
+        colramp = viridis_pal(),
+        main = "FRich")
+}
+
+# Richness
+p1 <- ggplot() +
+  geom_sf(data = land2, fill = "lightgray", color = NA)+
+  geom_raster(data = dataset, aes(x = x, y = y, fill = rich)) +
+  geom_sf(data = land2, fill = NA, size = .2, color = "black")+
+  coord_sf()+
+  scale_fill_viridis(breaks = func_splint(class_int$rich, 5, 2)) +
+  theme_map()+
+  theme(legend.position = c(0.1, 0.2), legend.title = element_blank())
+
+# PD
+p2 <- ggplot() +
+  geom_sf(data = land2, fill = "lightgray", color = NA)+
+  geom_raster(data = dataset, aes(x = x, y = y, fill = PDses)) +
+  geom_sf(data = land2, fill = NA, size = .2, color = "black")+
+  coord_sf()+
+  scale_fill_viridis(breaks = func_splint(class_int$PDses, 5, 2)) +
+  theme_map()+
+  theme(legend.position = c(0.1, 0.2), legend.title = element_blank())
+
+# FD
+p3 <- ggplot() +
+  geom_sf(data = land2, fill = "lightgray", color = NA)+
+  geom_raster(data = dataset, aes(x = x, y = y, fill = FRichses)) +
+  geom_sf(data = land2, fill = NA, size = .2, color = "black")+
+  coord_sf()+
+  scale_fill_viridis(breaks = func_splint(class_int$FRichses, 5, 2)) +
+  theme_map()+
+  theme(legend.position = c(0.1, 0.2), legend.title = element_blank())
+
+{
+  # x11(width = 10.5, height = 4)
+  pdf("Figs/Supp_biodiv.pdf", width = 10.5, height = 4)
+  plot_grid(p1, p2, p3, labels = "auto", ncol = 3)
+  dev.off()
+  }
+
+```
+
+### More metrics
+```{r}
+# Heigt
+mymap(ras = vars.ras$Height_mean, 
+      breaks = class_int$Height_mean,
+      labs = func_splint(class_int$Height_mean, 5, 3),
+      colramp = viridis_pal(),
+      main = "Height")
+
+plot(dataset$Height_mean,dataset$sens2.temp.abs)
+plot(dataset$Height_mean,dataset$sens.sea.temp.abs)
+
+summary(lm(sens.sea.temp.abs~log(Height_mean),dataset))
+
+plot(dataset$WoodDens_mean,dataset$sens.sea.temp.abs)
+
+summary(lm(sens.sea.temp.abs~(WoodDens_mean),dataset))
+
+```
+
+
+### 3D Maps
+
+```{r biotic.predictors3d, message=FALSE, warning=FALSE, fig.height=4, fig.width=10.5}
+
+{
+  plotRGB(stack(vars.ras$rich,
+                vars.ras$PDses,
+                vars.ras$FRichses), 
+          stretch='lin')
+  plot(land, add=T, cex = .6)
+}
+
+```
+
+# Scatter plots
+
+
+Many experimental and observational studies has reported a positive effect of biodiversity on the functioning and stability of ecosystems. Highly diversity areas potentially contain sets of species with disparate ecological strategies, physiological teolerance, more intense and complex cross-species interactions. All this can lead to a more efficient utilization of available resources, stronger and more stable ecological networks. We calculated three key biodiversity metrics: species richness, PD and FD. While richness increases the chance to capture species of higher ecological diversity, the PD and FD more directly relate to mechanistic predictions on how biodiversity enhances ecosystem resilience (lower sensitivity). Indeed, previous studies support a higher importance of PD and FD relative to richness on patterns of ecosystem functioning and resilience.
+
+## Sensitivity vs SES
+### Sensitivity to temperature
+```{r sens_tempabs_bio_ses, message=FALSE, warning=FALSE, fig.height=6, fig.width=9}
+
+p1 <- ggplot(dataset, aes(x = log10(rich), y = sens.sea.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim.sea)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p2 <- ggplot(dataset, aes(x = PDses, y = sens.sea.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim.sea)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p3 <- ggplot(dataset, aes(x = FRichses, y = sens.sea.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim.sea)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p4 <- ggplot(dataset, aes(x = log10(rich), y = sens2.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim2)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p5 <- ggplot(dataset, aes(x = PDses, y = sens2.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim2)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p6 <- ggplot(dataset, aes(x = FRichses, y = sens2.temp.abs))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = wtlim2)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         p3 + theme(legend.position="none"),
+                         p4 + theme(legend.position="none"),
+                         p5 + theme(legend.position="none"),
+                         p6 + theme(legend.position="none"),
+                         nrow = 2),
+             g_legend(p1 + theme(legend.position="bottom")), 
+             nrow=2,heights=c(10, 1)) 
+
+```
+
+### Sensitivity to precipitation
+```{r sens_precabs_bio_ses, message=FALSE, warning=FALSE, fig.height=7, fig.width=9}
+
+p1 <- ggplot(dataset, aes(x = log10(rich), y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p2 <- ggplot(dataset, aes(x = PDses, y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p3 <- ggplot(dataset, aes(x = FRichses, y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p4 <- ggplot(dataset, aes(x = log10(rich), y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p5 <- ggplot(dataset, aes(x = PDses, y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p6 <- ggplot(dataset, aes(x = FRichses, y = sens2.rel.temp2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         p3 + theme(legend.position="none"),
+                         p4 + theme(legend.position="none"),
+                         p5 + theme(legend.position="none"),
+                         p6 + theme(legend.position="none"),
+                         nrow = 2),
+             g_legend(p1 + theme(legend.position="bottom") +
+                        guides(color=guide_legend(title = "", ncol=4))), 
+             nrow=2,heights=c(5, 1)) 
+
+summary(lm(scale(sens2.rel.temp2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+summary(lm(scale(sens2.rel.temp2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+```
+
+## Constancy
+### Sensitivity to temperature
+```{r sens_tempabs_bio_ses, message=FALSE, warning=FALSE, fig.height=7.1, fig.width=9}
+
+p1 <- ggplot(dataset, aes(x = log10(rich), y = sens.sea.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p2 <- ggplot(dataset, aes(x = PDses, y = sens.sea.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p3 <- ggplot(dataset, aes(x = FRichses, y = sens.sea.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p4 <- ggplot(dataset, aes(x = log10(rich), y = sens2.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p5 <- ggplot(dataset, aes(x = PDses, y = sens2.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p6 <- ggplot(dataset, aes(x = FRichses, y = sens2.rel.temp.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to temperature (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         p3 + theme(legend.position="none"),
+                         p4 + theme(legend.position="none"),
+                         p5 + theme(legend.position="none"),
+                         p6 + theme(legend.position="none"),
+                         nrow = 2),
+             g_legend(p1 + theme(legend.position="bottom") +
+                        guides(color=guide_legend(title = "", ncol=4))), 
+             nrow=2,heights=c(5, 1)) 
+
+summary(lm(scale(sens.sea.rel.temp.abs2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+summary(lm(scale(sens2.rel.temp.abs2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+```
+
+### Sensitivity to precipitation
+```{r sens_precabs_bio_ses, message=FALSE, warning=FALSE, fig.height=7.1, fig.width=9}
+
+p1 <- ggplot(dataset, aes(x = log10(rich), y = sens.sea.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to precipitation (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p2 <- ggplot(dataset, aes(x = PDses, y = sens.sea.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to precipitation (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p3 <- ggplot(dataset, aes(x = FRichses, y = sens.sea.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to precipitation (Seasonality)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p4 <- ggplot(dataset, aes(x = log10(rich), y = sens2.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("log10 Richness") + ylab("Sensitivity to precipitation (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p5 <- ggplot(dataset, aes(x = PDses, y = sens2.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("PD SES") + ylab("Sensitivity to precipitation (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+p6 <- ggplot(dataset, aes(x = FRichses, y = sens2.rel.prec.abs2))+
+  theme_bw() + geom_hex()+
+  scale_fill_gradient(low="lightblue1",high="darkblue",trans="log10", name = "") +
+  xlab("FRich SES") + ylab("Sensitivity to precipitation (Annual)")+
+  geom_smooth(method = "lm", size = 2, se = F, aes(color = biome)) +
+  geom_smooth(method = "lm", size = 2, color = "black") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1,size=3)))+
+  theme(aspect.ratio=1)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         p3 + theme(legend.position="none"),
+                         p4 + theme(legend.position="none"),
+                         p5 + theme(legend.position="none"),
+                         p6 + theme(legend.position="none"),
+                         nrow = 2),
+             g_legend(p1 + theme(legend.position="bottom") +
+                        guides(color=guide_legend(title = "", ncol=4))), 
+             nrow=2,heights=c(5, 1)) 
+
+summary(lm(scale(sens.sea.rel.prec.abs2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+summary(lm(scale(sens2.rel.prec.abs2)~
+             scale(log10(rich))+scale(FRichses)+scale(PDses)+biome,
+           dataset))
+
+```
+
+
+
+# SAR models
+We fitted separated spatial autoregressive models using each of the sensitivity metric as response variable, and the three biodiversity metrics (Richness, PD, and FD) as predictors.
+
+```{r prep.sar, warning=F, message=F}
+
+datarun <- na.omit(dataset[,c("x","y","biome",
+                              "wtlim2","wtlim.sea",
+                              # sensitivity metrics
+                              "sens2.temp.abs", "sens2.temp.confint",
+                              "sens.sea.temp.abs", "sens.sea.temp.confint",
+                              "sens2.prec.abs", "sens2.prec.confint",
+                              "sens.sea.prec.abs", "sens.sea.prec.confint",
+                              # constancy metrics
+                              "sens2.rel.temp.abs2", "sens2.rel.temp.confint",
+                              "sens.sea.rel.temp.abs2", "sens.sea.rel.temp.confint",
+                              "sens2.rel.prec.abs2", "sens2.rel.prec.confint",
+                              "sens.sea.rel.prec.abs2", "sens.sea.rel.prec.confint",
+                              # biodiversity metrics
+                              "rich","PDses","FRichses")])
+
+# Log10 transform biodiversity metrics
+datarun$rich <- log10(datarun$rich)
+
+# test
+# plot(rasterFromXYZ(datarun[,1:3]))
+
+# Scale?
+# I ran models without scaling and got the error:
+# Error in solve.default(-(mat), tol.solve = tol.solve) : 
+# system is computationally singular: reciprocal condition number
+datarun[,c(
+  # sensitivity metrics
+  "sens2.temp.abs", 
+  "sens.sea.temp.abs", 
+  "sens2.prec.abs", 
+  "sens.sea.prec.abs",
+  # constancy metrics
+  "sens2.rel.temp.abs",
+  "sens.sea.rel.temp.abs2", 
+  "sens2.rel.prec.abs", 
+  "sens.sea.rel.prec.abs2",
+  # biodiversity metrics
+  "rich","PDses","FRichses")] <- 
+  scale(datarun[,c(
+    # sensitivity metrics
+    "sens2.temp.abs", 
+    "sens.sea.temp.abs", 
+    "sens2.prec.abs", 
+    "sens.sea.prec.abs",
+    # constancy metrics
+    "sens2.rel.temp.abs2",
+    "sens.sea.rel.temp.abs2", 
+    "sens2.rel.prec.abs2", 
+    "sens.sea.rel.prec.abs2",
+    # biodiversity metrics
+    "rich","PDses","FRichses")])
+
+# Fix weights
+datarun$sens2.temp.confint <- 1/datarun$sens2.temp.confint
+datarun$sens2.prec.confint <- 1/datarun$sens2.prec.confint
+
+datarun$sens.sea.temp.confint <- 1/datarun$sens.sea.temp.confint
+datarun$sens.sea.prec.confint <- 1/datarun$sens.sea.prec.confint
+
+datarun$sens2.rel.temp.confint <- 1/datarun$sens2.rel.temp.confint
+datarun$sens2.rel.prec.confint <- 1/datarun$sens2.rel.prec.confint
+
+datarun$sens.sea.rel.temp.confint <- 1/datarun$sens.sea.rel.temp.confint
+datarun$sens.sea.rel.prec.confint <- 1/datarun$sens.sea.rel.prec.confint
+
+# Models 
+models2go <- c(
+  # sens2.temp
+  'sens2.temp.abs ~ rich*wtlim2 + FRichses*wtlim2 + PDses*wtlim2',
+  'sens2.temp.abs ~ rich*biome + FRichses*biome + PDses*biome',
+  'sens2.rel.temp.abs2 ~ rich*biome + FRichses*biome + PDses*biome',
+  
+  # sens.sea.temp
+  'sens.sea.temp.abs ~ rich*wtlim.sea + FRichses*wtlim.sea + PDses*wtlim.sea',
+  'sens.sea.temp.abs ~ rich*biome + FRichses*biome + PDses*biome',
+  'sens.sea.rel.temp.abs2 ~ rich*biome + FRichses*biome + PDses*biome',
+  
+  # sens2.prec
+  'sens2.prec.abs ~ rich*wtlim2 + FRichses*wtlim2 + PDses*wtlim2',
+  'sens2.prec.abs ~ rich*biome + FRichses*biome + PDses*biome',
+  'sens2.rel.prec.abs2 ~ rich*biome + FRichses*biome + PDses*biome',
+  
+  # sens.sea.prec
+  'sens.sea.prec.abs ~ rich*wtlim.sea + FRichses*wtlim.sea + PDses*wtlim.sea',
+  'sens.sea.prec.abs ~ rich*biome + FRichses*biome + PDses*biome',
+  'sens.sea.rel.prec.abs2 ~ rich*biome + FRichses*biome + PDses*biome'
+)
+
+vars <- list(
+  # sens2.temp
+  c('sens2.temp.abs','rich','PDses','FRichses','wtlim2'),
+  c('sens2.temp.abs','rich','PDses','FRichses','biome'),
+  c('sens2.rel.temp.abs2','rich','PDses','FRichses','biome'),
+  
+  # sens.sea.temp
+  c('sens.sea.temp.abs','rich','PDses','FRichses','wtlim.sea'),
+  c('sens.sea.temp.abs','rich','PDses','FRichses','biome'),
+  c('sens.sea.rel.temp.abs2','rich','PDses','FRichses','biome'),
+  
+  # sens2.prec
+  c('sens2.prec.abs','rich','PDses','FRichses','wtlim2'),
+  c('sens2.prec.abs','rich','PDses','FRichses','biome'),
+  c('sens2.rel.prec.abs2','rich','PDses','FRichses','biome'),
+  
+  # sens.sea.prec
+  c('sens.sea.prec.abs','rich','PDses','FRichses','wtlim.sea'),
+  c('sens.sea.prec.abs','rich','PDses','FRichses','biome'),
+  c('sens.sea.rel.prec.abs2','rich','PDses','FRichses','biome')
+)
+
+# Weight paramenters
+weightpar <- c(rep("sens2.temp.confint",3),
+               rep("sens2.temp.confint",3),
+               rep("sens2.rel.temp.confint",3),
+               
+               rep("sens.sea.temp.confint",3),
+               rep("sens.sea.temp.confint",3),
+               rep("sens.rel.sea.temp.confint",3),
+               
+               rep("sens2.prec.confint",3),
+               rep("sens2.prec.confint",3),
+               rep("sens2.rel.prec.confint",3),
+               
+               rep("sens.sea.prec.confint",3),
+               rep("sens.sea.prec.confint",3),
+               rep("sens.sea.rel.prec.confint",3))
+
+# define connectivity matrix (0/1)
+nbdist<-dnearneigh(x=as.matrix(datarun[,1:2]), d1=0, d2=50000) 
+# compute the Euclidean distance between neighbouring sites
+neigh.dist<-nbdists(nbdist,
+                    as.matrix(datarun[,1:2]), longlat=F)
+# compute the inverse distance weigthed matrix
+inverse<-lapply(neigh.dist, function(x) (1/(x^2)))
+# coding style W = row standardised
+nlw <- nb2listw(neighbours=nbdist, 
+                glist=inverse,
+                style="W", 
+                zero.policy=T) 
+
+```
+
+## Send data to the cluster
+```{r SAR.models.save2cluster, message=FALSE, warning=FALSE, eval=F}
+
+# Save and send to the cluster
+# Models run the computer cluster
+saveRDS(datarun, "R/Cluster/SARmodels2/datarun.RDS")
+saveRDS(models2go, "R/Cluster/SARmodels2/models2go.RDS")
+saveRDS(vars, "R/Cluster/SARmodels2/vars.RDS")
+saveRDS(nlw, "R/Cluster/SARmodels2/nlw.RDS")
+
+```
+
+## List of models
+```{r my.models.tab.rich, message=FALSE, warning=FALSE}
+
+DT::datatable(data.frame(Models=models2go),
+              rownames = FALSE,
+              options = list(pageLength = 20, scrollY = "400px"))
+
+```
+
+## Check VIF models
+```{r my.models, eval=FALSE, message=FALSE, warning=FALSE}
+
+# VIF var models
+lms <- lapply(1:length(models2go), 
+              function(i) 
+                lm(formula(models2go[i]), data = datarun[,vars[[i]]],
+                   weights = datarun[,weightpar[i]]))
+
+vifs_lms <- lapply(lms, function(i) car::vif(i))
+vifs_lms <- do.call(rbind,vifs_lms)
+
+View(cbind(models2go,vifs_lms))
+
+# VIF vars
+HH::vif(x=datarun[,c("rich","PD","FRich")])
+
+
+# fit <- lm(sens2.temp.abs ~ rich*wtlim2 + FRichses*wtlim2 + PDses*wtlim2,
+#            data=dataset)
+# 
+# summary(fit)
+# 
+# int_wet = coef(fit)[1]
+# int_ene = coef(fit)[1] + coef(fit)[3]
+# 
+# slope_wet = coef(fit)[2]
+# slope_ene = coef(fit)[2] + coef(fit)[6]
+# 
+# plot(sens2.temp.abs ~ rich, data = dataset)
+# abline(int_wet, slope_wet, col = 1, lty = 1, lwd = 2) # line for foreign cars
+# abline(int_ene, slope_ene, col = 2, lty = 2, lwd = 2) # line for domestic cars
+# legend("topright", c("Foreign", "Domestic"), pch = c(1, 2), col = c(1, 2))
+
+```
+
+## Load results from SAR models
+```{r SAR.models.load, message=FALSE, warning=FALSE, include=FALSE}
+
+SAR.res <- list()
+for(i in 1:length(models2go)){ cat("\r",i,"from",length(models2go))
+  if(params$woody){
+    modeli <- readRDS(paste("R/Cluster/SARmodels2/Results/R", i,"w.RDS",sep=""))
+  }
+  else{
+    modeli <- readRDS(paste("R/Cluster/SARmodels2/Results/R", i,".RDS",sep=""))
+  }
+  modeli <- get.summary.models(modeli)
+  modeli$model <- models2go[i]
+  modeli$Response <- strsplit(models2go[i],split = " ~ ")[[1]][1]
+  modeli$Mi <- paste("M",i,sep = "")
+  SAR.res[[i]] <- modeli
+}
+
+SAR.res <- do.call(rbind, SAR.res)
+
+if(params$woody){
+  
+  SAR.res$var <- gsub("richw", "rich" , SAR.res$var)
+  SAR.res$var <- gsub("PDw", "PD" , SAR.res$var)
+  SAR.res$var <- gsub("FRichw", "FRich" , SAR.res$var)
+  
+}
+
+# Separate raw and SES
+
+ses.pos <- grep("ses",SAR.res$model)
+SAR.res.ses <- SAR.res[ses.pos,]
+SAR.res <- SAR.res[-ses.pos,]
+
+```
+
+
+## Plot SAR results
+## Biodiv Raw
+###  Biodiv only
+```{r SAR.models.res.raw, fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+
+SAR.res.raw.plot <- SAR.res[grep("rich + FRich + PD",SAR.res$model, fixed = T),]
+
+SAR.res.raw.plot$sig <- ifelse(SAR.res.raw.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.raw.plot$sig <- factor(SAR.res.raw.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.raw.plot$Response <- gsub("sens2.temp.abs","Temp. Annual", SAR.res.raw.plot$Response)
+SAR.res.raw.plot$Response <- gsub("sens.sea.temp.abs","Temp. Seasonality", SAR.res.raw.plot$Response)
+SAR.res.raw.plot$Response <- gsub("sens2.prec.abs","Prec. Annual", SAR.res.raw.plot$Response)
+SAR.res.raw.plot$Response <- gsub("sens.sea.prec.abs","Prec. Seasonality", SAR.res.raw.plot$Response)
+
+SAR.res.raw.plot$Response<-factor(SAR.res.raw.plot$Response, 
+                                  levels=c("Temp. Annual","Temp. Seasonality",
+                                           "Prec. Annual","Prec. Seasonality"))
+
+SAR.res.raw.plot$var.name <- SAR.res.raw.plot$var
+SAR.res.raw.plot$var.name <- gsub("rich","Rich", SAR.res.raw.plot$var)
+
+SAR.res.raw.plot$scale <- NA
+SAR.res.raw.plot$scale[grep("Annual", SAR.res.raw.plot$Response)] <- "Annual"
+SAR.res.raw.plot$scale[grep("Seasonality", SAR.res.raw.plot$Response)] <- "Seasonality"
+
+SAR.res.raw.plot$var.name<-factor(SAR.res.raw.plot$var.name, levels=c("Rich","PD","FRich"))
+
+SAR.res.raw.plot$sig <- as.factor(SAR.res.raw.plot$sig)
+
+pd <- position_dodge(0.5)
+
+ggplot(SAR.res.raw.plot, aes(x = var.name, y = Estimate)) +
+  # scale_alpha_discrete(c(.5,1))+
+  geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = pd, size = 1) +
+  geom_point(position=pd, size = 3) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black")+
+  theme_bw()+
+  labs(color = 'Predictor type', y="Std. Coeff. + CI", x= '')+
+  # theme(axis.text.x = element_text(angle = 45,  hjust = 1))+
+  theme(legend.position="bottom")+
+  facet_wrap(Response~scale,ncol = 2)
+
+```
+
+### Dir models
+Using absolute values on directionality
+```{r SAR.models.res.abs, fig.height=2.5, fig.width=10, message=FALSE, warning=FALSE}
+
+SAR.res.abs.plot <- SAR.res[grep("wtlim",SAR.res$model),]
+
+SAR.res.abs.plot$sig <- ifelse(SAR.res.abs.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.abs.plot$sig <- factor(SAR.res.abs.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.abs.plot$scale <- NA
+SAR.res.abs.plot$scale[grep("sens2", SAR.res.abs.plot$Response)] <- "Annual"
+SAR.res.abs.plot$scale[grep("sens.sea", SAR.res.abs.plot$Response)] <- "Seasonality"
+
+SAR.res.abs.plot$Response <- gsub("sens2.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens2.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+
+SAR.res.abs.plot$Response<-factor(SAR.res.abs.plot$Response, 
+                                  levels=c("Temperature",
+                                           "Precipitation"))
+
+# fix Water-limited vs Energy-limited 
+# The effect of the biodiv vars actually hold for the reference predictor, which is EnergyLimited
+SAR.res.abs.plot$var.name <- SAR.res.abs.plot$var
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="rich")] <- "rich:EnergyLimited"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="PD")] <- "PD:EnergyLimited"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="FRich")] <- "FRich:EnergyLimited"
+
+# keep only the interactions
+SAR.res.abs.plot <- SAR.res.abs.plot[grep(":",SAR.res.abs.plot$var.name),]
+
+SAR.res.abs.plot$var.name <- gsub("rich","Rich",SAR.res.abs.plot$var.name)
+SAR.res.abs.plot$direction <- SAR.res.abs.plot$var.name
+SAR.res.abs.plot$direction <- gsub("wtlim2","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("wtlim.sea","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub(":FRich","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("FRich:","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("Rich:","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub(":PD","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("PD:","",SAR.res.abs.plot$direction)
+
+SAR.res.abs.plot$var.name[grep("Rich",SAR.res.abs.plot$var.name)] <- "Rich"
+SAR.res.abs.plot$var.name[grep("PD",SAR.res.abs.plot$var)] <- "PD"
+SAR.res.abs.plot$var.name[grep("FRich",SAR.res.abs.plot$var)] <- "FD"
+SAR.res.abs.plot$var.name<-factor(SAR.res.abs.plot$var.name, 
+                                  levels=c("Rich","PD","FD"))
+
+SAR.res.abs.plot$direction <- as.factor(SAR.res.abs.plot$direction)
+
+# fix coeffs
+modelsi <- unique(SAR.res.abs.plot$model)
+varsi <- c("Rich","PD","FD")
+resm <- list()
+
+for(i in 1:length(unique(SAR.res.abs.plot$model))){
+  resv <- list()
+  for(j in 1:length(varsi)){
+    focus.rows <- which(SAR.res.abs.plot$model==modelsi[i] & SAR.res.abs.plot$var.name==varsi[j])
+    tmp <- SAR.res.abs.plot[focus.rows,]
+    CIs <- abs(tmp$Estimate - tmp$Higher_IC) # save CI for latter fix
+    remrows <- which(tmp$direction == "Energy limited")
+    ref <- as.numeric(tmp[remrows,c(1)])
+    tmp[-remrows,c(1)] <- tmp[-remrows,c(1)] + ref
+    # fix CIs
+    tmp$Lower_IC <- tmp$Estimate - CIs
+    tmp$Higher_IC <- tmp$Estimate + CIs
+    
+    resv[[j]] <- tmp
+  }
+  resm[[i]] <- do.call(rbind,resv)
+}
+resm <- do.call(rbind,resm)
+
+# if CI contains zero, slopes are not siginificant. If CI do not contain zero, they are significant.
+resm$sig <- ifelse(resm$Lower_IC < 0 & resm$Higher_IC > 0, 0, 1)
+resm$sig <- as.factor(resm$sig)
+
+resm$var.name <- factor(resm$var.name, 
+                        levels = rev(levels(resm$var.name)))
+
+# SAR.res.abs.plot$var.name <- factor(SAR.res.abs.plot$var.name, 
+#                                     levels = rev(levels(SAR.res.abs.plot$var.name)))
+
+p <- ggplot(data.frame(resm), aes(x = var.name, y = Estimate, 
+                                  alpha = sig, color = direction)) +
+  scale_alpha_discrete(c(.5,1), guide = F)+
+  geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = position_dodge(0.5)) +
+  geom_point(position=position_dodge(0.5)) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black")+
+  labs(color = "", y="Std. Coeff. + CI", x= '')+
+  theme_bw() +
+  coord_flip()+
+  theme(strip.background  = element_blank(),
+        legend.position="bottom",
+        strip.text=element_text(hjust=0, face = "bold"))+
+  # facet_wrap(Response~scale, nrow = 1, labeller = label_glue('{.l}'))
+  facet_wrap(scale~Response, nrow = 1, scales = "free_x",
+             labeller = label_glue('{.l}        {scale} - {Response}'))
+
+p
+
+```
+
+PS.:
+Positive interaction means the slope is smaller in water-limited than in energy-limited.
+Negative interaction means the slope is higher in water-limited than in energy-limited.
+
+
+### Biome models
+Using absolute values on biomes
+```{r SAR.models.res.biomes, fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+
+# get only abs
+SAR.res.abs.plot <- SAR.res[grep("biome",SAR.res$model),]
+
+SAR.res.abs.plot$sig <- ifelse(SAR.res.abs.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.abs.plot$sig <- factor(SAR.res.abs.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.abs.plot$scale <- NA
+SAR.res.abs.plot$scale[grep("sens2", SAR.res.abs.plot$Response)] <- "Annual"
+SAR.res.abs.plot$scale[grep("sens.sea", SAR.res.abs.plot$Response)] <- "Seasonality"
+
+SAR.res.abs.plot$Response <- gsub("sens2.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens2.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+
+SAR.res.abs.plot$Response<-factor(SAR.res.abs.plot$Response, 
+                                  levels=c("Temperature",
+                                           "Precipitation"))
+# fix biomes
+# The effect of the biodiv vars actually hold for the reference predictor, which is North Desert
+SAR.res.abs.plot$var.name <- SAR.res.abs.plot$var
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="rich")] <- "rich:North Desert"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="PD")] <- "PD:North Desert"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="FRich")] <- "FRich:North Desert"
+
+# keep only the interactions
+SAR.res.abs.plot <- SAR.res.abs.plot[grep(":",SAR.res.abs.plot$var.name),]
+
+SAR.res.abs.plot$var.name <- gsub("rich","Rich",SAR.res.abs.plot$var.name)
+SAR.res.abs.plot$biome <- SAR.res.abs.plot$var.name
+SAR.res.abs.plot$biome <- gsub("biome","",SAR.res.abs.plot$biome)
+SAR.res.abs.plot$biome <- gsub(":FRich","",SAR.res.abs.plot$biome)
+SAR.res.abs.plot$biome <- gsub("FRich:","",SAR.res.abs.plot$biome)
+SAR.res.abs.plot$biome <- gsub("Rich:","",SAR.res.abs.plot$biome)
+SAR.res.abs.plot$biome <- gsub(":PD","",SAR.res.abs.plot$biome)
+SAR.res.abs.plot$biome <- gsub("PD:","",SAR.res.abs.plot$biome)
+
+SAR.res.abs.plot$var.name[grep("Rich",SAR.res.abs.plot$var.name)] <- "Rich"
+SAR.res.abs.plot$var.name[grep("PD",SAR.res.abs.plot$var)] <- "PD"
+SAR.res.abs.plot$var.name[grep("FRich",SAR.res.abs.plot$var)] <- "FRich"
+SAR.res.abs.plot$var.name<-factor(SAR.res.abs.plot$var.name, 
+                                  levels=c("Rich","PD","FRich"))
+
+SAR.res.abs.plot$biome <- factor(SAR.res.abs.plot$biome, 
+                                 levels = biome.levels)
+
+# fix coeffs
+modelsi <- unique(SAR.res.abs.plot$model)
+varsi <- c("Rich","PD","FRich")
+resm <- list()
+
+for(i in 1:length(unique(SAR.res.abs.plot$model))){
+  resv <- list()
+  for(j in 1:length(varsi)){
+    focus.rows <- which(SAR.res.abs.plot$model==modelsi[i] & SAR.res.abs.plot$var.name==varsi[j])
+    tmp <- SAR.res.abs.plot[focus.rows,]
+    remrows <- which(tmp$biome == "Tundra")
+    ref <- as.numeric(tmp[remrows,c(1,3,4)])
+    tmp[,c(1,3,4)] <- tmp[,c(1,3,4)] + ref
+    tmp[remrows,c(1,3,4)] <- ref
+    
+    resv[[j]] <- tmp
+  }
+  resm[[i]] <- do.call(rbind,resv)
+}
+resm <- do.call(rbind,resm)
+
+pd <- position_dodge(.7)
+
+ggplot(resm, aes(x = biome, y = Estimate, 
+                 alpha = sig, color = var.name, group = var.name)) +
+  scale_alpha_discrete(c(.5,1), guide = F)+
+  # scale_color_viridis_d(direction = -1)+
+  geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = position_dodge(0.7)) +
+  geom_point(position=position_dodge(0.7)) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black")+
+  labs(color = '', y="Std. Coeff. + CI", x= '')+
+  ylim(c(-5, 5))+
+  theme_bw() +
+  coord_flip()+
+  theme(strip.background  = element_blank(),
+        strip.text=element_text(hjust=0, face = "bold"))+
+  facet_wrap(Response~scale, nrow = 1,
+             labeller = label_glue('{.l}\n{Response} \n{scale}'))
+
+```
+
+
+## SES
+###  Biodiv only
+```{r SAR.models.res.raw.ses, fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+
+SAR.res.ses.raw.plot <- SAR.res.ses[grep("rich + FRichses + PDses",SAR.res.ses$model, fixed = T),]
+
+SAR.res.ses.raw.plot$sig <- ifelse(SAR.res.ses.raw.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.ses.raw.plot$sig <- factor(SAR.res.ses.raw.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.ses.raw.plot$Response <- gsub("sens2.temp.abs","Temp. Annual", SAR.res.ses.raw.plot$Response)
+SAR.res.ses.raw.plot$Response <- gsub("sens.sea.temp.abs","Temp. Seasonality", SAR.res.ses.raw.plot$Response)
+SAR.res.ses.raw.plot$Response <- gsub("sens2.prec.abs","Prec. Annual", SAR.res.ses.raw.plot$Response)
+SAR.res.ses.raw.plot$Response <- gsub("sens.sea.prec.abs","Prec. Seasonality", SAR.res.ses.raw.plot$Response)
+
+SAR.res.ses.raw.plot$Response<-factor(SAR.res.ses.raw.plot$Response, 
+                                      levels=c("Temp. Annual","Temp. Seasonality",
+                                               "Prec. Annual","Prec. Seasonality"))
+
+SAR.res.ses.raw.plot$var.name <- SAR.res.ses.raw.plot$var
+SAR.res.ses.raw.plot$var.name <- gsub("rich","rich", SAR.res.ses.raw.plot$var)
+
+SAR.res.ses.raw.plot$scale <- NA
+SAR.res.ses.raw.plot$scale[grep("Annual", SAR.res.ses.raw.plot$Response)] <- "Annual"
+SAR.res.ses.raw.plot$scale[grep("Seasonality", SAR.res.ses.raw.plot$Response)] <- "Seasonality"
+
+SAR.res.ses.raw.plot$var.name<-factor(SAR.res.ses.raw.plot$var.name, levels=c("rich","PDses","FRichses"))
+
+SAR.res.ses.raw.plot$sig <- as.factor(SAR.res.ses.raw.plot$sig)
+
+PDses <- position_dodge(0.5)
+
+write.csv(SAR.res.ses.raw.plot, "Tables/SAR_res_global.csv")
+
+ggplot(SAR.res.ses.raw.plot, aes(x = var.name, y = Estimate)) +
+  # scale_alpha_discrete(c(.5,1))+
+  geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = PDses, size = 1) +
+  geom_point(position=PDses, size = 3) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black")+
+  theme_bw()+
+  labs(color = 'Predictor type', y="Std. Coeff. + CI", x= '')+
+  # theme(axis.text.x = element_text(angle = 45,  hjust = 1))+
+  theme(legend.position="bottom")+
+  facet_wrap(Response~scale,ncol = 2)
+
+```
+
+### Dir models
+Using absolute values on directionality
+```{r SAR.models.res.abs.ses, fig.height=4, fig.width=12, message=FALSE, warning=FALSE}
+
+SAR.res.abs.plot <- SAR.res.ses[grep("wtlim",SAR.res.ses$model),]
+
+SAR.res.abs.plot$sig <- ifelse(SAR.res.abs.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.abs.plot$sig <- factor(SAR.res.abs.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.abs.plot$scale <- NA
+SAR.res.abs.plot$scale[grep("sens2", SAR.res.abs.plot$Response)] <- "Annual"
+SAR.res.abs.plot$scale[grep("sens.sea", SAR.res.abs.plot$Response)] <- "Seasonality"
+
+SAR.res.abs.plot$Response <- gsub("sens2.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.temp.abs","Temperature", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens2.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+SAR.res.abs.plot$Response <- gsub("sens.sea.prec.abs","Precipitation", SAR.res.abs.plot$Response)
+
+SAR.res.abs.plot$Response<-factor(SAR.res.abs.plot$Response, 
+                                  levels=c("Temperature",
+                                           "Precipitation"))
+
+# fix Water-limited vs Energy-limited 
+# The effect of the biodiv vars actually hold for the reference predictor, which is EnergyLimited
+SAR.res.abs.plot$var.name <- SAR.res.abs.plot$var
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="rich")] <- "rich:EnergyLimited"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="PDses")] <- "PDses:EnergyLimited"
+SAR.res.abs.plot$var.name[which(SAR.res.abs.plot$var.name=="FRichses")] <- "FRichses:EnergyLimited"
+
+# keep only the interactions
+SAR.res.abs.plot <- SAR.res.abs.plot[grep(":",SAR.res.abs.plot$var.name),]
+
+SAR.res.abs.plot$var.name <- gsub("rich","Rich",SAR.res.abs.plot$var.name)
+SAR.res.abs.plot$direction <- SAR.res.abs.plot$var.name
+SAR.res.abs.plot$direction <- gsub("wtlim2","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("wtlim.sea","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub(":FRichses","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("FRichses:","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("Rich:","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub(":PDses","",SAR.res.abs.plot$direction)
+SAR.res.abs.plot$direction <- gsub("PDses:","",SAR.res.abs.plot$direction)
+
+SAR.res.abs.plot$var.name[grep("Rich",SAR.res.abs.plot$var.name)] <- "Richness"
+SAR.res.abs.plot$var.name[grep("PDses",SAR.res.abs.plot$var)] <- "PD"
+SAR.res.abs.plot$var.name[grep("FRichses",SAR.res.abs.plot$var)] <- "FD"
+SAR.res.abs.plot$var.name<-factor(SAR.res.abs.plot$var.name, 
+                                  levels=c("Richness","PD","FD"))
+
+SAR.res.abs.plot$scale[grep("Annual",SAR.res.abs.plot$scale)] <- "Inter-annual"
+SAR.res.abs.plot$scale[grep("Seasonality",SAR.res.abs.plot$scale)] <- "Seasonal"
+
+SAR.res.abs.plot$direction[grep("WaterLimited",SAR.res.abs.plot$direction)] <- "Water limited"
+SAR.res.abs.plot$direction[grep("EnergyLimited",SAR.res.abs.plot$direction)] <- "Energy limited"
+
+SAR.res.abs.plot$direction <- as.factor(SAR.res.abs.plot$direction)
+
+# fix coeffs
+modelsi <- unique(SAR.res.abs.plot$model)
+varsi <- c("Richness","PD","FD")
+resm <- list()
+
+for(i in 1:length(unique(SAR.res.abs.plot$model))){
+  resv <- list()
+  for(j in 1:length(varsi)){
+    focus.rows <- which(SAR.res.abs.plot$model==modelsi[i] & SAR.res.abs.plot$var.name==varsi[j])
+    tmp <- SAR.res.abs.plot[focus.rows,]
+    CIs <- abs(tmp$Estimate - tmp$Higher_IC) # save CI for latter fix
+    remrows <- which(tmp$direction == "Energy limited")
+    ref <- as.numeric(tmp[remrows,c(1)])
+    tmp[-remrows,c(1)] <- tmp[-remrows,c(1)] + ref
+    # fix CIs
+    tmp$Lower_IC <- tmp$Estimate - CIs
+    tmp$Higher_IC <- tmp$Estimate + CIs
+    
+    resv[[j]] <- tmp
+  }
+  resm[[i]] <- do.call(rbind,resv)
+}
+resm <- do.call(rbind,resm)
+
+# if CI contains zero, slopes are not siginificant. If CI do not contain zero, they are significant.
+resm$sig <- ifelse(resm$Lower_IC < 0 & resm$Higher_IC > 0, 0, 1)
+resm$sig <- as.factor(resm$sig)
+
+resm$var.name <- factor(resm$var.name, 
+                        levels = levels(resm$var.name))
+
+p <- list()
+p.scales <- unique(resm$scale)
+p.Response <- unique(resm$Response)
+togo <- expand.grid(p.scales, p.Response)
+
+for(i in 1:nrow(togo)){
+  p.data <- resm[which(resm$scale == togo[i,1]),]
+  p.data <- p.data[which(p.data$Response == togo[i,2]),]
+  
+  pi <- ggplot(data.frame(p.data), aes(x = direction, y = Estimate, 
+                                       # alpha = sig, 
+                                       color = direction)) +
+    scale_alpha_discrete(c(.5,1), guide = F)+
+    geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = position_dodge(0.5)) +
+    geom_point(position=position_dodge(0.5), size = 2) +
+    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+    labs(color = "", y="Std. Coeff. + CI", x= '')+
+    theme_bw() +
+    coord_cartesian(ylim = c(-1, 1))+
+    coord_flip()+
+    ggtitle(paste(p.data$scale[1], p.data$Response[1],sep = " - ")) +
+    theme(strip.background  = element_blank(),
+          strip.text.x = element_text(hjust = 0.5),
+          plot.title = element_text(hjust = 0.5))+
+    facet_wrap(.~var.name, ncol = 3)
+  
+  p[[i]] <- pi + theme(legend.position="none")
+}
+
+pi <- ggarrange(p[[1]],
+                p[[3]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()),
+                p[[2]],
+                p[[4]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()), 
+                nrow = 2, ncol = 2, 
+                labels = letters[1:4],
+                common.legend = TRUE, legend = "bottom",
+                widths = c(1.4,1),
+                align = "h")
+pi
+
+pdf("Figs/SAR_dir.pdf",width = 12, height = 4)
+pi
+dev.off()
+
+```
+
+PS.:
+Positive interaction means the slope is smaller in water-limited than in energy-limited.
+Negative interaction means the slope is higher in water-limited than in energy-limited.
+
+Seasonal scale: responsiveness to watter means reponse to resources. temperature main represent stress, not resource. So, reduce sensitivity to temperature would be benefical.
+
+
+### Biome models
+Using absolute values on biomes
+```{r SAR.models.res.biomes.ses, fig.height=7, fig.width=12, message=FALSE, warning=FALSE}
+
+# get only abs
+SAR.res.ses.abs.plot <- SAR.res.ses[grep("biome",SAR.res.ses$model),]
+SAR.res.ses.abs.plot <- SAR.res.ses.abs.plot[-grep("rel",SAR.res.ses.abs.plot$model),]
+
+SAR.res.ses.abs.plot$sig <- ifelse(SAR.res.ses.abs.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.ses.abs.plot$sig <- factor(SAR.res.ses.abs.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.ses.abs.plot$scale <- NA
+SAR.res.ses.abs.plot$scale[grep("sens2", SAR.res.ses.abs.plot$Response)] <- "Annual"
+SAR.res.ses.abs.plot$scale[grep("sens.sea", SAR.res.ses.abs.plot$Response)] <- "Seasonality"
+
+SAR.res.ses.abs.plot$Response <- ifelse(grepl("temp",SAR.res.ses.abs.plot$Response), "Temperature", "Precipitation")
+
+SAR.res.ses.abs.plot$Response<-factor(SAR.res.ses.abs.plot$Response, 
+                                      levels=c("Temperature",
+                                               "Precipitation"))
+# fix biomes
+# The effect of the biodiv vars actually hold for the reference predictor, which is Tundra
+SAR.res.ses.abs.plot$var.name <- SAR.res.ses.abs.plot$var
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="rich")] <- "rich:Tundra"
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="PDses")] <- "PDses:Tundra"
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="FRichses")] <- "FRichses:Tundra"
+
+# keep only the interactions
+SAR.res.ses.abs.plot <- SAR.res.ses.abs.plot[grep(":",SAR.res.ses.abs.plot$var.name),]
+
+SAR.res.ses.abs.plot$var.name <- gsub("rich","Rich",SAR.res.ses.abs.plot$var.name)
+SAR.res.ses.abs.plot$biome <- SAR.res.ses.abs.plot$var.name
+SAR.res.ses.abs.plot$biome <- gsub("biome","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub(":FRichses","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("FRichses:","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("Rich:","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub(":PDses","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("PDses:","",SAR.res.ses.abs.plot$biome)
+
+SAR.res.ses.abs.plot$var.name[grep("Rich",SAR.res.ses.abs.plot$var.name)] <- "Richness"
+SAR.res.ses.abs.plot$var.name[grep("PDses",SAR.res.ses.abs.plot$var)] <- "PD"
+SAR.res.ses.abs.plot$var.name[grep("FRichses",SAR.res.ses.abs.plot$var)] <- "FD"
+SAR.res.ses.abs.plot$var.name<-factor(SAR.res.ses.abs.plot$var.name, 
+                                      levels=c("Richness","PD","FD"))
+
+SAR.res.ses.abs.plot$scale[grep("Annual",SAR.res.ses.abs.plot$scale)] <- "Inter-annual"
+SAR.res.ses.abs.plot$scale[grep("Seasonality",SAR.res.ses.abs.plot$scale)] <- "Seasonal"
+
+SAR.res.ses.abs.plot$biome <- factor(SAR.res.ses.abs.plot$biome, 
+                                     levels = biome.levels)
+
+# fix coeffs
+modelsi <- unique(SAR.res.ses.abs.plot$model)
+varsi <- c("Richness","PD","FD")
+resm <- list()
+
+for(i in 1:length(unique(SAR.res.ses.abs.plot$model))){
+  resv <- list()
+  for(j in 1:length(varsi)){
+    focus.rows <- which(SAR.res.ses.abs.plot$model==modelsi[i] & SAR.res.ses.abs.plot$var.name==varsi[j])
+    tmp <- SAR.res.ses.abs.plot[focus.rows,]
+    CIs <- abs(tmp$Estimate - tmp$Higher_IC) # save CI for latter fix
+    remrows <- which(tmp$biome == "Tundra")
+    ref <- as.numeric(tmp[remrows,c(1)])
+    tmp[-remrows,c(1)] <- tmp[-remrows,c(1)] + ref
+    # fix CIs
+    tmp$Lower_IC <- tmp$Estimate - CIs
+    tmp$Higher_IC <- tmp$Estimate + CIs
+    
+    resv[[j]] <- tmp
+  }
+  resm[[i]] <- do.call(rbind,resv)
+}
+resm <- do.call(rbind,resm)
+
+# if CI contains zero, slopes are not siginificant. If CI do not contain zero, they are significant.
+resm$sig <- ifelse(resm$Lower_IC < 0 & resm$Higher_IC > 0, 0, 1)
+resm$sig <- as.factor(resm$sig)
+
+# remove mangroves because they tend to show outlier coefficients and small area
+resm <- na.omit(resm)
+
+# classify biomes to limitation
+biomlim <- dataset %>%
+  group_by(biome) %>%
+  summarise(lim2 = mean(sens2.prec - sens2.temp, na.rm = T),
+            lim.sea = mean(sens.sea.prec - sens.sea.temp, na.rm = T))
+biomlim$lim2 <- ifelse(biomlim$lim2 < 0, "Energy Limited", "Water Limited")
+biomlim$lim.sea <- ifelse(biomlim$lim.sea < 0, "Energy Limited", "Water Limited")
+
+resm <- merge(resm,biomlim,by="biome")
+resm$limitation <- NA
+for(i in 1:length(resm$scale)){
+  resm$limitation[i] <- ifelse(resm$scale[i] == "Inter-annual", 
+                               resm$lim2[i], resm$lim.sea[i])}
+
+# order biomes by temperature variation
+biome.temp <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temp = mean(temp, na.rm = T))
+biome.levels <- biome.temp$biome[order(biome.temp$Temp)]
+biome.levels <- na.omit(biome.levels)
+
+resm$biome <- factor(resm$biome, levels = (biome.levels))
+
+p <- list()
+p.scales <- unique(resm$scale)
+p.Response <- unique(resm$Response)
+togo <- expand.grid(p.scales, p.Response)
+
+for(i in 1:nrow(togo)){
+  p.data <- resm[which(resm$scale == togo[i,1]),]
+  p.data <- p.data[which(p.data$Response == togo[i,2]),]
+  
+  pi <- ggplot(p.data, aes(x = biome, y = Estimate, 
+                           # alpha = sig,
+                           # shape = limitation,
+                           color = var.name,
+                           group = var.name)) +
+    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+    # scale_alpha_discrete(c(.5,1), guide = F)+
+    # scale_color_viridis_d(direction = -1)+
+    geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC)) +
+    geom_point(size = 2) +
+    labs(color = 'Biodiversity', shape = 'Limitation',
+         y="Std. Coeff. + CI", x= '')+
+    # coord_cartesian(ylim = c(-1, 1))+
+    theme_bw() +
+    # theme(aspect.ratio=2)+
+    coord_flip()+ 
+    ggtitle(paste(p.data$scale[1], p.data$Response[1],sep = " - ")) +
+    theme(strip.background  = element_blank(),
+          strip.text.x = element_text(hjust = 0.5),
+          plot.title = element_text(hjust = 0.5))+
+    facet_wrap(.~var.name)
+  
+  p[[i]] <- pi + theme(legend.position="none")
+}
+
+pi <- ggarrange(p[[1]],
+                p[[3]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()),
+                p[[2]],
+                p[[4]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()), 
+                nrow = 2, ncol = 2, 
+                labels = letters[1:4],
+                common.legend = TRUE, legend = "right",
+                widths = c(1.4,1),
+                align = "h")
+pi
+
+# pdf("Figs/SAR_biomes.pdf", width = 12, height = 7)
+# pi
+# dev.off()
+
+```
+
+#### Orgnize effects
+##### by temperature
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+
+# Inter-annual
+i=1
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temperature = mean(temp, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_temp_scale-annual.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Temperature, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Mean annual temperature")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+# Seasonal
+i=2
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temperature = mean(temp, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_temp_scale-seasonal.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Temperature, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Mean annual temperature")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+
+```
+
+##### by aridity
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+
+# Inter-annual
+i=1
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Aridity = mean(ari, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_ari_scale-annual.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Aridity, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Aridity")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+# Seasonal
+i=2
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Aridity = mean(ari, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_ari_scale-seasonal.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Aridity, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Aridity")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+
+```
+
+##### by richness
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+
+# Inter-annual
+i=1
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Aridity = mean(rich, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_rich_scale-annual.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Aridity, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Richness")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+# Seasonal
+i=2
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Aridity = mean(rich, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_rich_scale-seasonal.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Aridity, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  xlab("Richness")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+
+```
+
+
+### Biome models (constancy)
+
+```{r SAR.models.res.biomes.ses, fig.height=5, fig.width=12, message=FALSE, warning=FALSE}
+
+# get only abs
+SAR.res.ses.abs.plot <- SAR.res.ses[grep("biome",SAR.res.ses$model),]
+SAR.res.ses.abs.plot <- SAR.res.ses.abs.plot[grep("rel",SAR.res.ses.abs.plot$model),]
+
+SAR.res.ses.abs.plot$sig <- ifelse(SAR.res.ses.abs.plot$`Pr(>|z|)` < 0.05, "<0.05", "NS")
+SAR.res.ses.abs.plot$sig <- factor(SAR.res.ses.abs.plot$sig, levels = c( "NS","<0.05"))
+
+SAR.res.ses.abs.plot$scale <- NA
+SAR.res.ses.abs.plot$scale[grep("sens2.rel", SAR.res.ses.abs.plot$Response)] <- "Annual"
+SAR.res.ses.abs.plot$scale[grep("sens.sea.rel", SAR.res.ses.abs.plot$Response)] <- "Seasonality"
+
+SAR.res.ses.abs.plot$Response <- ifelse(grepl("temp",SAR.res.ses.abs.plot$Response), "Temperature", "Precipitation")
+
+SAR.res.ses.abs.plot$Response<-factor(SAR.res.ses.abs.plot$Response, 
+                                      levels=c("Temperature",
+                                               "Precipitation"))
+# fix biomes
+# The effect of the biodiv vars actually hold for the reference predictor, which is Tundra
+SAR.res.ses.abs.plot$var.name <- SAR.res.ses.abs.plot$var
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="rich")] <- "rich:Tundra"
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="PDses")] <- "PDses:Tundra"
+SAR.res.ses.abs.plot$var.name[which(SAR.res.ses.abs.plot$var.name=="FRichses")] <- "FRichses:Tundra"
+
+# keep only the interactions
+SAR.res.ses.abs.plot <- SAR.res.ses.abs.plot[grep(":",SAR.res.ses.abs.plot$var.name),]
+
+SAR.res.ses.abs.plot$var.name <- gsub("rich","Rich",SAR.res.ses.abs.plot$var.name)
+SAR.res.ses.abs.plot$biome <- SAR.res.ses.abs.plot$var.name
+SAR.res.ses.abs.plot$biome <- gsub("biome","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub(":FRichses","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("FRichses:","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("Rich:","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub(":PDses","",SAR.res.ses.abs.plot$biome)
+SAR.res.ses.abs.plot$biome <- gsub("PDses:","",SAR.res.ses.abs.plot$biome)
+
+SAR.res.ses.abs.plot$var.name[grep("Rich",SAR.res.ses.abs.plot$var.name)] <- "Richness"
+SAR.res.ses.abs.plot$var.name[grep("PDses",SAR.res.ses.abs.plot$var)] <- "PD"
+SAR.res.ses.abs.plot$var.name[grep("FRichses",SAR.res.ses.abs.plot$var)] <- "FD"
+SAR.res.ses.abs.plot$var.name<-factor(SAR.res.ses.abs.plot$var.name, 
+                                      levels=c("Richness","PD","FD"))
+
+SAR.res.ses.abs.plot$scale[grep("Annual",SAR.res.ses.abs.plot$scale)] <- "Inter-annual"
+SAR.res.ses.abs.plot$scale[grep("Seasonality",SAR.res.ses.abs.plot$scale)] <- "Seasonal"
+
+SAR.res.ses.abs.plot$biome <- factor(SAR.res.ses.abs.plot$biome, levels = biome.levels)
+
+# fix coeffs
+modelsi <- unique(SAR.res.ses.abs.plot$model)
+varsi <- c("Richness","PD","FD")
+resm <- list()
+
+for(i in 1:length(unique(SAR.res.ses.abs.plot$model))){
+  resv <- list()
+  for(j in 1:length(varsi)){
+    focus.rows <- which(SAR.res.ses.abs.plot$model==modelsi[i] & SAR.res.ses.abs.plot$var.name==varsi[j])
+    tmp <- SAR.res.ses.abs.plot[focus.rows,]
+    CIs <- abs(tmp$Estimate - tmp$Higher_IC) # save CI for latter fix
+    remrows <- which(tmp$biome == "Tundra")
+    ref <- as.numeric(tmp[remrows,c(1)])
+    tmp[-remrows,c(1)] <- tmp[-remrows,c(1)] + ref
+    # fix CIs
+    tmp$Lower_IC <- tmp$Estimate - CIs
+    tmp$Higher_IC <- tmp$Estimate + CIs
+    
+    resv[[j]] <- tmp
+  }
+  resm[[i]] <- do.call(rbind,resv)
+}
+resm <- do.call(rbind,resm)
+
+# if CI contains zero, slopes are not siginificant. If CI do not contain zero, they are significant.
+resm$sig <- ifelse(resm$Lower_IC < 0 & resm$Higher_IC > 0, 0, 1)
+resm$sig <- as.factor(resm$sig)
+
+# remove mangroves because they tend to show outlier coefficients and small area
+resm <- na.omit(resm)
+
+# classify biomes to limitation
+biomlim <- dataset %>%
+  group_by(biome) %>%
+  summarise(lim2 = mean(sens2.rel.prec - sens2.rel.temp),
+            lim.sea = mean(sens.sea.rel.prec - sens.sea.rel.temp))
+biomlim$lim2 <- ifelse(biomlim$lim2 < 0, "Energy Limited", "Water Limited")
+biomlim$lim.sea <- ifelse(biomlim$lim.sea < 0, "Energy Limited", "Water Limited")
+
+resm <- merge(resm,biomlim,by="biome")
+resm$limitation <- NA
+for(i in 1:length(resm$scale)){
+  resm$limitation[i] <- ifelse(resm$scale[i] == "Inter-annual", 
+                               resm$lim2[i], resm$lim.sea[i])}
+
+# order biomes by temperature variation
+biome.temp <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temp = mean(temp, na.rm = T))
+biome.levels <- biome.temp$biome[order(biome.temp$Temp)]
+biome.levels <- na.omit(biome.levels)
+
+resm$biome <- factor(resm$biome, levels = (biome.levels))
+
+p <- list()
+p.scales <- unique(resm$scale)
+p.Response <- unique(resm$Response)
+togo <- expand.grid(p.scales, p.Response)
+
+for(i in 1:nrow(togo)){
+  p.data <- resm[which(resm$scale == togo[i,1]),]
+  p.data <- p.data[which(p.data$Response == togo[i,2]),]
+  
+  pi <- ggplot(p.data, aes(x = biome, y = Estimate, 
+                           # alpha = sig,
+                           # shape = limitation,
+                           color = var.name,
+                           group = var.name)) +
+    scale_alpha_discrete(c(.5,1), guide = F)+
+    # scale_color_viridis_d(direction = -1)+
+    geom_linerange(aes(ymin=Lower_IC, ymax=Higher_IC), position = position_dodge(0.7)) +
+    geom_point(position=position_dodge(0.7), size = 2) +
+    labs(color = 'Biodiversity', shape = 'Limitation', 
+         y="Std. Coeff. + CI", x= '')+
+    # coord_cartesian(ylim = c(-1, 1))+
+    theme_bw() +
+    # theme(aspect.ratio=2)+
+    coord_flip()+ 
+    ggtitle(paste(p.data$scale[1], p.data$Response[1],sep = " - ")) +
+    theme(strip.background  = element_blank(),
+          strip.text.x = element_text(hjust = 0.5),
+          plot.title = element_text(hjust = 0.5))+
+    geom_hline(yintercept=0, linetype="dashed", color = "black")+
+    facet_wrap(.~var.name)
+  
+  p[[i]] <- pi + theme(legend.position="none")
+}
+
+pi <- ggarrange(p[[1]],
+                p[[3]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()),
+                p[[2]],
+                p[[4]] + theme(axis.text.y = element_blank(),
+                               axis.ticks.y = element_blank()), 
+                nrow = 2, ncol = 2, 
+                labels = letters[1:4],
+                common.legend = TRUE, legend = "right",
+                widths = c(1.4,1),
+                align = "h")
+pi
+
+# pdf("Figs/SAR_biomes_constancy.pdf", width = 12, height = 7)
+pi
+# dev.off()
+
+
+```
+
+#### Orgnize effects
+
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+i=1
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temperature = mean(temp, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_temp_scale-annual.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Temperature, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+i=2
+p.data <- resm[which(resm$scale == togo[i,1]),]
+
+aridity <- dataset %>%
+  group_by(biome) %>%
+  summarise(Temperature = mean(temp, na.rm = T))
+
+p.data <- merge(p.data, aridity, by = "biome")
+
+# pdf("Figs/SAR_sort_temp_scale-seasonal.pdf", width = 7, height = 7)
+ggplot(p.data, aes(x = Temperature, y = Estimate, 
+                   color = biome, group = var.name))+
+  geom_point()+
+  geom_smooth(method = "lm")+
+  facet_wrap(var.name~Response, ncol = 2, scales = "free")
+# dev.off()
+
+
+```
+
+
+
+# Save
+```{r save, eval=F, message=FALSE, warning=FALSE}
+save.image("R/4_Analyses.RData")
+```
